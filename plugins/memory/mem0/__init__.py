@@ -1,16 +1,22 @@
 """Mem0 memory plugin — MemoryProvider interface.
 
-Server-side LLM fact extraction, semantic search with reranking, and
-automatic deduplication via the Mem0 Platform API.
+Supports two modes:
+  - cloud: Mem0 Platform API with server-side LLM fact extraction
+  - local: Self-hosted with Ollama embeddings + ChromaDB + configurable LLM
 
-Original PR #2933 by kartik-mem0, adapted to MemoryProvider ABC.
-
-Config via environment variables:
-  MEM0_API_KEY       — Mem0 Platform API key (required)
-  MEM0_USER_ID       — User identifier (default: hermes-user)
-  MEM0_AGENT_ID      — Agent identifier (default: hermes)
-
-Or via $HERMES_HOME/mem0.json.
+Config via $HERMES_HOME/mem0.json:
+  mode: "cloud" | "local"
+  api_key: Mem0 Platform API key (cloud mode)
+  user_id: User identifier
+  agent_id: Agent identifier
+  rerank: Enable reranking (cloud mode)
+  ollama_base_url: Ollama server URL (local mode, default http://localhost:11434)
+  embedding_model: Embedding model name (local mode, default nomic-embed-text:latest)
+  llm_model: LLM model name for fact extraction (local mode)
+  llm_base_url: OpenAI-compatible API base URL (local mode)
+  llm_api_key_env: Env var name for LLM API key (local mode)
+  db_path: ChromaDB storage path (local mode, default $HERMES_HOME/mem0-local-db)
+  collection_name: ChromaDB collection name (local mode, default hermes-memory)
 """
 
 from __future__ import annotations
@@ -38,18 +44,14 @@ _BREAKER_COOLDOWN_SECS = 120
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
-
-    Environment variables provide defaults; mem0.json (if present) overrides
-    individual keys.  This avoids a silent failure when the JSON file exists
-    but is missing fields like ``api_key`` that the user set in ``.env``.
-    """
+    """Load config from env vars, with $HERMES_HOME/mem0.json overrides."""
     from hermes_constants import get_hermes_home
 
     config = {
         "api_key": os.environ.get("MEM0_API_KEY", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
+        "mode": "cloud",
         "rerank": True,
         "keyword_search": False,
     }
@@ -113,11 +115,58 @@ CONCLUDE_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Local mode helpers
+# ---------------------------------------------------------------------------
+
+def _build_local_config(cfg: dict) -> dict:
+    """Build mem0 config dict for local Memory.from_config()."""
+    from hermes_constants import get_hermes_home
+
+    db_path = cfg.get("db_path", str(get_hermes_home() / "mem0-local-db"))
+    collection = cfg.get("collection_name", "hermes-memory")
+    ollama_url = cfg.get("ollama_base_url", "http://localhost:11434")
+    embed_model = cfg.get("embedding_model", "nomic-embed-text:latest")
+    llm_model = cfg.get("llm_model", "glm-5.1")
+    llm_base_url = cfg.get("llm_base_url", "https://api.z.ai/api/coding/paas/v4")
+
+    # Resolve API key: env var name or direct value
+    api_key_env = cfg.get("llm_api_key_env", "GLM_API_KEY")
+    api_key = os.environ.get(api_key_env, cfg.get("llm_api_key", ""))
+
+    return {
+        "vector_store": {
+            "provider": "chroma",
+            "config": {
+                "collection_name": collection,
+                "path": db_path,
+            },
+        },
+        "llm": {
+            "provider": "openai",
+            "config": {
+                "model": llm_model,
+                "temperature": 0,
+                "max_tokens": 1500,
+                "openai_base_url": llm_base_url,
+                "api_key": api_key,
+            },
+        },
+        "embedder": {
+            "provider": "ollama",
+            "config": {
+                "model": embed_model,
+                "ollama_base_url": ollama_url,
+            },
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
 class Mem0MemoryProvider(MemoryProvider):
-    """Mem0 Platform memory with server-side extraction and semantic search."""
+    """Mem0 memory with cloud and local mode support."""
 
     def __init__(self):
         self._config = None
@@ -127,6 +176,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
         self._rerank = True
+        self._mode = "cloud"
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
@@ -141,11 +191,14 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         cfg = _load_config()
+        mode = cfg.get("mode", "cloud")
+        if mode == "local":
+            # Local mode: just need Ollama running
+            return True
         return bool(cfg.get("api_key"))
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/mem0.json."""
-        import json
         from pathlib import Path
         config_path = Path(hermes_home) / "mem0.json"
         existing = {}
@@ -159,10 +212,16 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def get_config_schema(self):
         return [
-            {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
+            {"key": "mode", "description": "Memory mode: cloud or local", "default": "cloud", "choices": ["cloud", "local"]},
+            {"key": "api_key", "description": "Mem0 Platform API key (cloud mode)", "secret": True, "required": False, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
+            {"key": "rerank", "description": "Enable reranking for recall (cloud mode)", "default": "true", "choices": ["true", "false"]},
+            {"key": "llm_model", "description": "LLM model for fact extraction (local mode)", "default": "glm-5.1"},
+            {"key": "llm_base_url", "description": "LLM API base URL (local mode)", "default": "https://api.z.ai/api/coding/paas/v4"},
+            {"key": "llm_api_key_env", "description": "Env var name for LLM API key (local mode)", "default": "GLM_API_KEY"},
+            {"key": "embedding_model", "description": "Embedding model (local mode)", "default": "nomic-embed-text:latest"},
+            {"key": "ollama_base_url", "description": "Ollama server URL (local mode)", "default": "http://localhost:11434"},
         ]
 
     def _get_client(self):
@@ -171,8 +230,24 @@ class Mem0MemoryProvider(MemoryProvider):
             if self._client is not None:
                 return self._client
             try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
+                if self._mode == "local":
+                    from mem0 import Memory
+                    local_cfg = _build_local_config(self._config)
+                    # mem0's OpenAILLM hijacks OPENROUTER_API_KEY if present,
+                    # ignoring the configured api_key/base_url.  Temporarily
+                    # hide it so mem0 uses the correct LLM endpoint.
+                    _or_key = os.environ.pop("OPENROUTER_API_KEY", None)
+                    try:
+                        self._client = Memory.from_config(local_cfg)
+                    finally:
+                        if _or_key is not None:
+                            os.environ["OPENROUTER_API_KEY"] = _or_key
+                    logger.info("Mem0 local mode initialized. LLM=%s, embed=%s",
+                                self._config.get("llm_model", "glm-5.1"),
+                                self._config.get("embedding_model", "nomic-embed-text:latest"))
+                else:
+                    from mem0 import MemoryClient
+                    self._client = MemoryClient(api_key=self._api_key)
                 return self._client
             except ImportError:
                 raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
@@ -182,7 +257,6 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._consecutive_failures < _BREAKER_THRESHOLD:
             return False
         if time.monotonic() >= self._breaker_open_until:
-            # Cooldown expired — reset and allow a retry
             self._consecutive_failures = 0
             return False
         return True
@@ -202,24 +276,27 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
+        self._mode = self._config.get("mode", "cloud")
         self._api_key = self._config.get("api_key", "")
-        # Prefer gateway-provided user_id for per-user memory scoping;
-        # fall back to config/env default for CLI (single-user) sessions.
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
 
-    def _read_filters(self) -> Dict[str, Any]:
-        """Filters for search/get_all — scoped to user only for cross-session recall."""
-        return {"user_id": self._user_id}
+    def _read_kwargs(self) -> Dict[str, Any]:
+        """Kwargs for search/get_all — user-scoped."""
+        if self._mode == "local":
+            return {"user_id": self._user_id}
+        return {"filters": {"user_id": self._user_id}}
 
-    def _write_filters(self) -> Dict[str, Any]:
-        """Filters for add — scoped to user + agent for attribution."""
-        return {"user_id": self._user_id, "agent_id": self._agent_id}
+    def _write_kwargs(self) -> Dict[str, Any]:
+        """Kwargs for add — user + agent scoped."""
+        if self._mode == "local":
+            return {"user_id": self._user_id, "agent_id": self._agent_id}
+        return {"filters": {"user_id": self._user_id, "agent_id": self._agent_id}}
 
     @staticmethod
     def _unwrap_results(response: Any) -> list:
-        """Normalize Mem0 API response — v2 wraps results in {"results": [...]}."""
+        """Normalize Mem0 API response — both cloud and local wrap in {"results": [...]}."""
         if isinstance(response, dict):
             return response.get("results", [])
         if isinstance(response, list):
@@ -227,9 +304,10 @@ class Mem0MemoryProvider(MemoryProvider):
         return []
 
     def system_prompt_block(self) -> str:
+        mode_str = "Local" if self._mode == "local" else "Cloud"
         return (
             "# Mem0 Memory\n"
-            f"Active. User: {self._user_id}.\n"
+            f"Active ({mode_str}). User: {self._user_id}.\n"
             "Use mem0_search to find memories, mem0_conclude to store facts, "
             "mem0_profile for a full overview."
         )
@@ -251,12 +329,15 @@ class Mem0MemoryProvider(MemoryProvider):
         def _run():
             try:
                 client = self._get_client()
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=self._rerank,
-                    top_k=5,
-                ))
+                kwargs = self._read_kwargs()
+                if self._mode == "local":
+                    results = self._unwrap_results(client.search(
+                        query=query, limit=5, **kwargs,
+                    ))
+                else:
+                    results = self._unwrap_results(client.search(
+                        query=query, rerank=self._rerank, top_k=5, **kwargs,
+                    ))
                 if results:
                     lines = [r.get("memory", "") for r in results if r.get("memory")]
                     with self._prefetch_lock:
@@ -270,7 +351,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        """Send the turn to Mem0 for fact extraction (non-blocking)."""
         if self._is_breaker_open():
             return
 
@@ -281,13 +362,13 @@ class Mem0MemoryProvider(MemoryProvider):
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-                client.add(messages, **self._write_filters())
+                write_kwargs = self._write_kwargs()
+                client.add(messages, **write_kwargs)
                 self._record_success()
             except Exception as e:
                 self._record_failure()
                 logger.warning("Mem0 sync failed: %s", e)
 
-        # Wait for any previous sync before starting a new one
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
 
@@ -310,7 +391,11 @@ class Mem0MemoryProvider(MemoryProvider):
 
         if tool_name == "mem0_profile":
             try:
-                memories = self._unwrap_results(client.get_all(filters=self._read_filters()))
+                read_kwargs = self._read_kwargs()
+                if self._mode == "local":
+                    memories = self._unwrap_results(client.get_all(**read_kwargs))
+                else:
+                    memories = self._unwrap_results(client.get_all(**read_kwargs))
                 self._record_success()
                 if not memories:
                     return json.dumps({"result": "No memories stored yet."})
@@ -327,12 +412,15 @@ class Mem0MemoryProvider(MemoryProvider):
             rerank = args.get("rerank", False)
             top_k = min(int(args.get("top_k", 10)), 50)
             try:
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=rerank,
-                    top_k=top_k,
-                ))
+                read_kwargs = self._read_kwargs()
+                if self._mode == "local":
+                    results = self._unwrap_results(client.search(
+                        query=query, limit=top_k, **read_kwargs,
+                    ))
+                else:
+                    results = self._unwrap_results(client.search(
+                        query=query, rerank=rerank, top_k=top_k, **read_kwargs,
+                    ))
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
@@ -347,9 +435,10 @@ class Mem0MemoryProvider(MemoryProvider):
             if not conclusion:
                 return tool_error("Missing required parameter: conclusion")
             try:
+                write_kwargs = self._write_kwargs()
                 client.add(
                     [{"role": "user", "content": conclusion}],
-                    **self._write_filters(),
+                    **write_kwargs,
                     infer=False,
                 )
                 self._record_success()
