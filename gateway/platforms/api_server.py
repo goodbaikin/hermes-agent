@@ -2,8 +2,8 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
-- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
-- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
+- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header)
+- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
@@ -44,11 +44,13 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.node_registry import NODE_REGISTRY
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     is_network_accessible,
 )
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -699,71 +701,6 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Session header helpers
-    # ------------------------------------------------------------------
-
-    # Soft length cap for session identifiers.  Headers are bounded in
-    # aggregate by aiohttp (``client_max_size`` / default 8 KiB per
-    # header), but we impose a tighter limit on the session headers so a
-    # caller can't burn memory by passing a multi-kilobyte "session key".
-    # 256 chars is well above any realistic stable channel identifier
-    # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
-    # that the sanitized form is safe to pass into Honcho / state.db.
-    _MAX_SESSION_HEADER_LEN = 256
-
-    def _parse_session_key_header(
-        self, request: "web.Request"
-    ) -> tuple[Optional[str], Optional["web.Response"]]:
-        """Extract and validate the ``X-Hermes-Session-Key`` header.
-
-        The session key is a stable per-channel identifier that scopes
-        long-term memory (e.g. Honcho sessions) across transcripts.  It
-        is independent of ``X-Hermes-Session-Id``: callers may send
-        either, both, or neither.
-
-        Returns ``(session_key, None)`` on success (with an empty/absent
-        header yielding ``None`` for the key), or ``(None, error_response)``
-        on validation failure.
-
-        Security: like session continuation, accepting a caller-supplied
-        memory scope requires API-key authentication so that an
-        unauthenticated client on a local-only server can't inject itself
-        into another user's long-term memory scope by guessing a key.
-        """
-        raw = request.headers.get("X-Hermes-Session-Key", "").strip()
-        if not raw:
-            return None, None
-
-        if not self._api_key:
-            logger.warning(
-                "X-Hermes-Session-Key rejected: no API key configured. "
-                "Set API_SERVER_KEY to enable long-term memory scoping."
-            )
-            return None, web.json_response(
-                _openai_error(
-                    "X-Hermes-Session-Key requires API key authentication. "
-                    "Configure API_SERVER_KEY to enable this feature."
-                ),
-                status=403,
-            )
-
-        # Reject control characters that could enable header injection on
-        # the echo path.
-        if re.search(r'[\r\n\x00]', raw):
-            return None, web.json_response(
-                {"error": {"message": "Invalid session key", "type": "invalid_request_error"}},
-                status=400,
-            )
-
-        if len(raw) > self._MAX_SESSION_HEADER_LEN:
-            return None, web.json_response(
-                {"error": {"message": "Session key too long", "type": "invalid_request_error"}},
-                status=400,
-            )
-
-        return raw, None
-
-    # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
 
@@ -793,7 +730,6 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
-        gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -802,13 +738,6 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
-
-        ``gateway_session_key`` is a stable per-channel identifier supplied
-        by the client (via ``X-Hermes-Session-Key``).  Unlike ``session_id``
-        which scopes the short-term transcript and rotates on /new, this
-        key is meant to persist across transcripts so long-term memory
-        providers (e.g. Honcho) can scope their per-chat state correctly
-        — matching the semantics of the native gateway's ``session_key``.
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
@@ -844,7 +773,6 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
-            gateway_session_key=gateway_session_key,
         )
         return agent
 
@@ -928,7 +856,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "tool_progress_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
-                "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -999,15 +926,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
             )
-
-        # Allow caller to scope long-term memory (e.g. Honcho) with a
-        # stable per-channel identifier via X-Hermes-Session-Key.  This
-        # is independent of X-Hermes-Session-Id: the key persists across
-        # transcripts while the id rotates when the caller starts a new
-        # transcript (i.e. /new semantics).  See _parse_session_key_header.
-        gateway_session_key, key_err = self._parse_session_key_header(request)
-        if key_err is not None:
-            return key_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -1143,13 +1061,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
-                gateway_session_key=gateway_session_key,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1159,7 +1075,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
-                gateway_session_key=gateway_session_key,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1209,17 +1124,11 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        response_headers = {
-            "X-Hermes-Session-Id": result.get("session_id", session_id),
-        }
-        if gateway_session_key:
-            response_headers["X-Hermes-Session-Key"] = gateway_session_key
-        return web.json_response(response_data, headers=response_headers)
+        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1242,8 +1151,6 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers.update(cors)
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
-        if gateway_session_key:
-            sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
@@ -1367,7 +1274,6 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation: Optional[str],
         store: bool,
         session_id: str,
-        gateway_session_key: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -1410,8 +1316,6 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers.update(cors)
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
-        if gateway_session_key:
-            sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
@@ -1861,11 +1765,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        # Long-term memory scope header (see chat_completions for details).
-        gateway_session_key, key_err = self._parse_session_key_header(request)
-        if key_err is not None:
-            return key_err
-
         # Parse request body
         try:
             body = await request.json()
@@ -2017,7 +1916,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -2038,7 +1936,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation=conversation,
                 store=store,
                 session_id=session_id,
-                gateway_session_key=gateway_session_key,
             )
 
         async def _compute_response():
@@ -2047,7 +1944,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
-                gateway_session_key=gateway_session_key,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2122,10 +2018,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
-        response_headers = {"X-Hermes-Session-Id": session_id}
-        if gateway_session_key:
-            response_headers["X-Hermes-Session-Key"] = gateway_session_key
-        return web.json_response(response_data, headers=response_headers)
+        return web.json_response(response_data)
 
     # ------------------------------------------------------------------
     # GET / DELETE response endpoints
@@ -2381,6 +2274,236 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": str(e)}, status=500)
 
     # ------------------------------------------------------------------
+    # Read-only / metadata APIs for web UIs
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_session_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": record.get("id"),
+            "source": record.get("source"),
+            "user_id": record.get("user_id"),
+            "model": record.get("model"),
+            "title": record.get("title"),
+            "started_at": record.get("started_at"),
+            "ended_at": record.get("ended_at"),
+            "end_reason": record.get("end_reason"),
+            "message_count": record.get("message_count") or 0,
+            "tool_call_count": record.get("tool_call_count") or 0,
+            "input_tokens": record.get("input_tokens") or 0,
+            "output_tokens": record.get("output_tokens") or 0,
+            "last_active": record.get("last_active"),
+            "parent_session_id": record.get("parent_session_id"),
+        }
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if not db:
+                return web.json_response({"items": [], "total": 0})
+            limit = max(1, min(500, int(request.query.get("limit", "50"))))
+            offset = max(0, int(request.query.get("offset", "0")))
+            items = db.list_sessions_rich(limit=limit, offset=offset)
+            total = db.session_count()
+            return web.json_response({
+                "items": [self._normalize_session_record(item) for item in items],
+                "total": total,
+            })
+        except Exception as e:
+            logger.exception("Error listing sessions")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if not db:
+                return web.json_response({"error": "Session DB unavailable"}, status=503)
+            session_id = request.match_info.get("session_id", "")
+            resolved = db.resolve_session_id(session_id) or session_id
+            item = db.get_session(resolved)
+            if not item:
+                return web.json_response({"error": "Session not found"}, status=404)
+            return web.json_response({"session": self._normalize_session_record(item)})
+        except Exception as e:
+            logger.exception("Error getting session")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json() if request.can_read_body else {}
+            requested_id = str(body.get("id") or "").strip()
+            session_id = requested_id or str(uuid.uuid4())
+            title = str(body.get("title") or "").strip() or None
+            model = str(body.get("model") or "").strip() or None
+            db = self._ensure_session_db()
+            if not db:
+                return web.json_response({"error": "Session DB unavailable"}, status=503)
+            created_id = db.create_session(session_id=session_id, source="api_server", model=model)
+            if title:
+                try:
+                    db.set_session_title(created_id, title)
+                except Exception:
+                    pass
+            item = db.get_session(created_id) or {"id": created_id, "model": model, "title": title, "started_at": time.time()}
+            return web.json_response({"session": self._normalize_session_record(item)})
+        except Exception as e:
+            logger.exception("Error creating session")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_update_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if not db:
+                return web.json_response({"error": "Session DB unavailable"}, status=503)
+            session_id = request.match_info.get("session_id", "")
+            resolved = db.resolve_session_id(session_id) or session_id
+            body = await request.json() if request.can_read_body else {}
+            title = str(body.get("title") or "").strip()
+            if not title:
+                return web.json_response({"error": "title required"}, status=400)
+            ok = db.set_session_title(resolved, title)
+            if not ok:
+                return web.json_response({"error": "Session not found"}, status=404)
+            item = db.get_session(resolved)
+            return web.json_response({"session": self._normalize_session_record(item or {"id": resolved, "title": title})})
+        except Exception as e:
+            logger.exception("Error updating session")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if not db:
+                return web.json_response({"error": "Session DB unavailable"}, status=503)
+            session_id = request.match_info.get("session_id", "")
+            resolved = db.resolve_session_id(session_id) or session_id
+            ok = db.delete_session(resolved)
+            if not ok:
+                return web.json_response({"error": "Session not found"}, status=404)
+            return web.json_response({"ok": True, "session_id": resolved})
+        except Exception as e:
+            logger.exception("Error deleting session")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_session_messages(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            db = self._ensure_session_db()
+            if not db:
+                return web.json_response({"items": [], "total": 0})
+            session_id = request.match_info.get("session_id", "")
+            resolved = db.resolve_session_id(session_id) or session_id
+            items = db.get_messages(resolved)
+            return web.json_response({"items": items, "total": len(items)})
+        except Exception as e:
+            logger.exception("Error getting session messages")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.memory_tool import get_memory_dir
+            mem_dir = get_memory_dir()
+            result = {}
+            for name in ("MEMORY.md", "USER.md"):
+                path = mem_dir / name
+                if path.exists():
+                    result[name] = path.read_text(encoding="utf-8")
+            return web.json_response(result)
+        except Exception as e:
+            logger.exception("Error reading memory")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import yaml
+            from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files
+
+            skills = []
+            for skills_dir in get_all_skills_dirs():
+                if not skills_dir.is_dir():
+                    continue
+                for skill_path in iter_skill_index_files(skills_dir, "SKILL.md"):
+                    try:
+                        raw = skill_path.read_text(encoding="utf-8")
+                        frontmatter = {}
+                        if raw.startswith("---"):
+                            parts = raw.split("---", 2)
+                            if len(parts) >= 3:
+                                frontmatter = yaml.safe_load(parts[1]) or {}
+                        skill_dir = skill_path.parent
+                        name = frontmatter.get("name") or skill_dir.name
+                        skills.append({
+                            "id": name,
+                            "name": name,
+                            "description": frontmatter.get("description", ""),
+                            "author": frontmatter.get("author", ""),
+                            "tags": frontmatter.get("tags", []),
+                            "triggers": frontmatter.get("triggers", []),
+                            "category": frontmatter.get("category", ""),
+                            "installed": True,
+                            "enabled": True,
+                            "sourcePath": str(skill_path),
+                            "content": raw,
+                        })
+                    except Exception as skill_err:
+                        logger.debug("Error reading skill %s: %s", skill_path, skill_err)
+            return web.json_response({"items": skills, "total": len(skills)})
+        except Exception as e:
+            logger.exception("Error listing skills")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_config(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            import copy
+            import yaml
+
+            config_path = get_hermes_home() / "config.yaml"
+            if not config_path.exists():
+                return web.json_response({})
+            with open(config_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            safe_keys = [
+                "model", "provider", "display", "memory", "timezone",
+                "skills", "toolsets", "agent", "tts", "stt",
+                "smart_model_routing", "custom_providers",
+            ]
+            safe_config = {k: copy.deepcopy(config[k]) for k in safe_keys if k in config}
+            if "custom_providers" in safe_config and isinstance(safe_config["custom_providers"], list):
+                for provider in safe_config["custom_providers"]:
+                    if isinstance(provider, dict):
+                        provider.pop("api_key", None)
+            return web.json_response(safe_config)
+        except Exception as e:
+            logger.exception("Error reading config")
+            return web.json_response({"error": str(e)}, status=500)
+
+    # ------------------------------------------------------------------
     # Output extraction helper
     # ------------------------------------------------------------------
 
@@ -2447,7 +2570,6 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
-        gateway_session_key: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2470,7 +2592,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2485,12 +2606,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
             }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
             return result, usage
 
         return await loop.run_in_executor(None, _run)
@@ -2569,11 +2684,6 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-
-        # Long-term memory scope header (see chat_completions for details).
-        gateway_session_key, key_err = self._parse_session_key_header(request)
-        if key_err is not None:
-            return key_err
 
         # Enforce concurrency limit
         if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
@@ -2683,7 +2793,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
-                    gateway_session_key=gateway_session_key,
                 )
                 self._active_run_agents[run_id] = agent
                 def _run_sync():
@@ -2784,14 +2893,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        response_headers = (
-            {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
-        )
-        return web.json_response(
-            {"run_id": run_id, "status": "started"},
-            status=202,
-            headers=response_headers,
-        )
+        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
@@ -2955,6 +3057,21 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # Read-only / metadata APIs for web UIs
+            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_post("/api/sessions", self._handle_create_session)
+            self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_patch("/api/sessions/{session_id}", self._handle_update_session)
+            self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+            self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_get_session_messages)
+            self._app.router.add_get("/api/memory", self._handle_get_memory)
+            self._app.router.add_get("/api/skills", self._handle_list_skills)
+            self._app.router.add_get("/api/config", self._handle_get_config)
+            # Remote node HTTP API
+            self._app.router.add_get("/v1/nodes", self._handle_list_nodes)
+            self._app.router.add_post("/v1/nodes/{node_id}/invoke", self._handle_node_invoke)
+            # Remote node WebSocket (OpenClaw-style gateway-node protocol)
+            self._app.router.add_get("/ws", self._handle_ws)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
@@ -3061,3 +3178,140 @@ class APIServerAdapter(BasePlatformAdapter):
             "host": self._host,
             "port": self._port,
         }
+
+    # ------------------------------------------------------------------
+    # Remote Node WebSocket handler
+    # ------------------------------------------------------------------
+
+    async def _handle_ws(self, request: "web.Request") -> "web.WebSocketResponse":
+        """
+        WebSocket endpoint for remote node connections.
+
+        OpenClaw-style protocol:
+        1. Node sends {type:"req", method:"connect", params:{role:"node", ...}}
+        2. Gateway responds {type:"res", ok:true, payload:{type:"hello-ok", ...}}
+        3. Gateway sends {type:"event", event:"node.invoke.request", payload:{...}}
+        4. Node responds {type:"event", event:"node.invoke.result", payload:{...}}
+        """
+        if not AIOHTTP_AVAILABLE or web is None:
+            return web.Response(status=503, text="aiohttp not available")
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        node_session = None
+        node_id = None
+
+        try:
+            async for msg in ws:
+                if msg.type != web.WSMsgType.TEXT:
+                    continue
+
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get("type")
+                event = data.get("event")
+
+                # --- Handshake ---
+                if msg_type == "req" and data.get("method") == "connect":
+                    params = data.get("params", {})
+                    role = params.get("role", "")
+                    if role != "node":
+                        await ws.send_str(json.dumps({
+                            "type": "res",
+                            "id": data.get("id"),
+                            "ok": False,
+                            "error": {"message": "Only 'node' role is supported on /ws"},
+                        }))
+                        await ws.close()
+                        return ws
+
+                    node_id = params.get("client", {}).get("id", "unknown")
+                    caps = params.get("caps", [])
+                    commands = params.get("commands", [])
+                    platform = params.get("client", {}).get("platform", "unknown")
+                    version = params.get("client", {}).get("version", "unknown")
+
+                    from gateway.node_registry import NodeSession
+
+                    def send_fn(payload: Dict[str, Any]) -> None:
+                        asyncio.create_task(ws.send_str(json.dumps(payload)))
+
+                    node_session = NodeSession(
+                        node_id=node_id,
+                        send_fn=send_fn,
+                        caps=caps,
+                        commands=commands,
+                        platform=platform,
+                        version=version,
+                    )
+                    await NODE_REGISTRY.register(node_session)
+
+                    await ws.send_str(json.dumps({
+                        "type": "res",
+                        "id": data.get("id"),
+                        "ok": True,
+                        "payload": {
+                            "type": "hello-ok",
+                            "protocol": 1,
+                            "policy": {
+                                "maxPayload": 26214400,
+                                "tickIntervalMs": 15000,
+                            },
+                        },
+                    }))
+                    continue
+
+                # --- Invoke result from node ---
+                if msg_type == "event" and event == "node.invoke.result":
+                    payload = data.get("payload", {})
+                    request_id = payload.get("id")
+                    ok = payload.get("ok", False)
+                    result_payload = payload.get("payload")
+                    error = payload.get("error")
+                    NODE_REGISTRY.handle_result(request_id, ok, result_payload, error)
+                    continue
+
+        except Exception as exc:
+            logger.warning("[Node WS] Connection error for %s: %s", node_id, exc)
+        finally:
+            if node_id:
+                await NODE_REGISTRY.unregister(node_id)
+            if not ws.closed:
+                await ws.close()
+
+        return ws
+
+    # ------------------------------------------------------------------
+    # Node HTTP API handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_list_nodes(self, request: "web.Request") -> "web.Response":
+        """GET /v1/nodes — list all connected remote nodes."""
+        nodes = NODE_REGISTRY.list_nodes()
+        return web.json_response({"ok": True, "nodes": nodes})
+
+    async def _handle_node_invoke(self, request: "web.Request") -> "web.Response":
+        """POST /v1/nodes/{node_id}/invoke — invoke a command on a remote node."""
+        node_id = request.match_info.get("node_id", "")
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": {"message": "Invalid JSON body"}}, status=400)
+
+        command = body.get("command", "")
+        params = body.get("params", {})
+        timeout_ms = body.get("timeoutMs", 30000)
+        idempotency_key = body.get("idempotencyKey")
+
+        result = await NODE_REGISTRY.invoke(
+            node_id=node_id,
+            command=command,
+            params=params,
+            timeout_ms=timeout_ms,
+            idempotency_key=idempotency_key,
+        )
+        return web.json_response(result)
