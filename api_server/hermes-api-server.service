@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes Agent API Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/goodbaikin/.hermes/hermes-agent/.venv/bin/python -m api_server
+WorkingDirectory=/home/goodbaikin/.hermes/hermes-agent
+Environment=HOME=/home/goodbaikin
+Environment=API_SERVER_ENABLED=true
+Environment=API_SERVER_HOST=127.0.0.1
+Environment=API_SERVER_PORT=8642
+Environment=API_SERVER_KEY=
+Environment=API_SERVER_CORS_ORIGINS=*
+Environment=API_SERVER_MODEL_NAME=hermes-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1393,6 +1393,13 @@ def cmd_gateway(args):
     gateway_command(args)
 
 
+def cmd_api_server(args):
+    """API server management commands."""
+    from hermes_cli.api_server_cmd import api_server_command
+
+    api_server_command(args)
+
+
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
@@ -8448,6 +8455,35 @@ def main():
     )
 
     gateway_parser.set_defaults(func=cmd_gateway)
+
+    # =========================================================================
+    # api-server command
+    # =========================================================================
+    api_server_parser = subparsers.add_parser(
+        "api-server",
+        help="API server management",
+        description="Manage the OpenAI-compatible API server",
+    )
+    api_server_subparsers = api_server_parser.add_subparsers(dest="api_server_command")
+
+    api_server_run = api_server_subparsers.add_parser(
+        "run", help="Run API server in foreground"
+    )
+    api_server_run.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase stderr log verbosity (-v=INFO, -vv=DEBUG)",
+    )
+    api_server_run.add_argument(
+        "-q", "--quiet", action="store_true", help="Suppress all stderr log output"
+    )
+
+    api_server_subparsers.add_parser("status", help="Show API server status")
+    api_server_subparsers.add_parser("stop", help="Stop API server process")
+
+    api_server_parser.set_defaults(func=cmd_api_server)
 
     # =========================================================================
     # setup command

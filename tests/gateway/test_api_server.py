@@ -23,16 +23,12 @@ from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.api_server import (
-    APIServerAdapter,
+from api_server.server import (
+    StandaloneAPIServer,
     ResponseStore,
-    _IdempotencyCache,
-    _CORS_HEADERS,
-    _derive_chat_session_id,
     check_api_server_requirements,
-    cors_middleware,
-    security_headers_middleware,
 )
+from api_server.middleware import _CORS_HEADERS, cors_middleware, security_headers_middleware, _IdempotencyCache, _derive_chat_session_id
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +40,7 @@ class TestCheckRequirements:
     def test_returns_true_when_aiohttp_available(self):
         assert check_api_server_requirements() is True
 
-    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
+    @patch("api_server.server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
 
@@ -203,7 +199,7 @@ class TestIdempotencyCache:
 class TestAdapterInit:
     def test_default_config(self):
         config = PlatformConfig(enabled=True)
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         assert adapter._host == "127.0.0.1"
         assert adapter._port == 8642
         assert adapter._api_key == ""
@@ -219,7 +215,7 @@ class TestAdapterInit:
                 "cors_origins": ["http://localhost:3000"],
             },
         )
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         assert adapter._host == "0.0.0.0"
         assert adapter._port == 9999
         assert adapter._api_key == "sk-test"
@@ -231,7 +227,7 @@ class TestAdapterInit:
         monkeypatch.setenv("API_SERVER_KEY", "sk-env")
         monkeypatch.setenv("API_SERVER_CORS_ORIGINS", "http://localhost:3000, http://127.0.0.1:3000")
         config = PlatformConfig(enabled=True)
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         assert adapter._host == "10.0.0.1"
         assert adapter._port == 7777
         assert adapter._api_key == "sk-env"
@@ -243,7 +239,7 @@ class TestAdapterInit:
     def test_invalid_port_from_env_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("API_SERVER_PORT", "not-a-port")
         config = PlatformConfig(enabled=True)
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         assert adapter._port == 8642
 
     def test_create_agent_forwards_config_reasoning_effort(self, monkeypatch):
@@ -274,7 +270,7 @@ class TestAdapterInit:
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter = StandaloneAPIServer(PlatformConfig(enabled=True))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
         agent = adapter._create_agent(session_id="api-session")
@@ -291,21 +287,21 @@ class TestAdapterInit:
 class TestAuth:
     def test_no_key_configured_allows_all(self):
         config = PlatformConfig(enabled=True)
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         mock_request = MagicMock()
         mock_request.headers = {}
         assert adapter._check_auth(mock_request) is None
 
     def test_valid_key_passes(self):
         config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         mock_request = MagicMock()
         mock_request.headers = {"Authorization": "Bearer sk-test123"}
         assert adapter._check_auth(mock_request) is None
 
     def test_invalid_key_returns_401(self):
         config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         mock_request = MagicMock()
         mock_request.headers = {"Authorization": "Bearer wrong-key"}
         result = adapter._check_auth(mock_request)
@@ -314,7 +310,7 @@ class TestAuth:
 
     def test_missing_auth_header_returns_401(self):
         config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         mock_request = MagicMock()
         mock_request.headers = {}
         result = adapter._check_auth(mock_request)
@@ -323,7 +319,7 @@ class TestAuth:
 
     def test_malformed_auth_header_returns_401(self):
         config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         mock_request = MagicMock()
         mock_request.headers = {"Authorization": "Basic dXNlcjpwYXNz"}
         result = adapter._check_auth(mock_request)
@@ -336,7 +332,7 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(api_key: str = "", cors_origins=None) -> StandaloneAPIServer:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
@@ -344,10 +340,10 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
     if cors_origins is not None:
         extra["cors_origins"] = cors_origins
     config = PlatformConfig(enabled=True, extra=extra)
-    return APIServerAdapter(config)
+    return StandaloneAPIServer(config)
 
 
-def _create_app(adapter: APIServerAdapter) -> web.Application:
+def _create_app(adapter: StandaloneAPIServer) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
@@ -520,7 +516,7 @@ class TestModelsEndpoint:
     @pytest.mark.asyncio
     async def test_models_returns_profile_name(self):
         """When running under a named profile, /v1/models advertises the profile name."""
-        with patch("gateway.platforms.api_server.APIServerAdapter._resolve_model_name", return_value="lucas"):
+        with patch("api_server.server.StandaloneAPIServer._resolve_model_name", return_value="lucas"):
             adapter = _make_adapter()
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -535,21 +531,21 @@ class TestModelsEndpoint:
         """Explicit model_name in config overrides profile name."""
         extra = {"model_name": "my-custom-agent"}
         config = PlatformConfig(enabled=True, extra=extra)
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         assert adapter._model_name == "my-custom-agent"
 
     def test_resolve_model_name_explicit(self):
-        assert APIServerAdapter._resolve_model_name("my-bot") == "my-bot"
+        assert StandaloneAPIServer._resolve_model_name("my-bot") == "my-bot"
 
     def test_resolve_model_name_default_profile(self):
         """Default profile falls back to 'hermes-agent'."""
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
-            assert APIServerAdapter._resolve_model_name("") == "hermes-agent"
+            assert StandaloneAPIServer._resolve_model_name("") == "hermes-agent"
 
     def test_resolve_model_name_named_profile(self):
         """Named profile uses the profile name as model name."""
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="lucas"):
-            assert APIServerAdapter._resolve_model_name("") == "lucas"
+            assert StandaloneAPIServer._resolve_model_name("") == "lucas"
 
     @pytest.mark.asyncio
     async def test_models_requires_auth(self, auth_adapter):
@@ -681,7 +677,7 @@ class TestChatCompletionsEndpoint:
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
         """Idle SSE streams should send keepalive comments while tools run silently."""
         import asyncio
-        import gateway.platforms.api_server as api_server_mod
+        import api_server.server as api_server_mod
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -1653,7 +1649,7 @@ class TestResponsesStreaming:
                 written_payloads.append(payload)
 
         # Patch web.StreamResponse for the duration of the writer call.
-        import gateway.platforms.api_server as api_mod
+        import api_server.handlers.responses as responses_mod
         import queue as _q
 
         stream_q: _q.Queue = _q.Queue()
@@ -1669,9 +1665,9 @@ class TestResponsesStreaming:
         agent_task = asyncio.ensure_future(_agent_coro())
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
 
-        with patch.object(api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()):
+        with patch.object(responses_mod.web, "StreamResponse", return_value=_FakeStreamResponse()):
             with pytest.raises(asyncio.CancelledError):
-                await adapter._write_sse_responses(
+                await responses_mod.write_sse_responses(
                     request=fake_request,
                     response_id=response_id,
                     model="hermes-agent",
@@ -1685,6 +1681,7 @@ class TestResponsesStreaming:
                     conversation=None,
                     store=True,
                     session_id=None,
+                    adapter=adapter,
                 )
 
         # The in_progress snapshot was persisted on response.created,
@@ -1724,7 +1721,7 @@ class TestResponsesStreaming:
                 if write_call_count["n"] >= 3:
                     raise ConnectionResetError("simulated client disconnect")
 
-        import gateway.platforms.api_server as api_mod
+        import api_server.handlers.responses as responses_mod
         import queue as _q
 
         stream_q: _q.Queue = _q.Queue()
@@ -1739,8 +1736,8 @@ class TestResponsesStreaming:
         agent_task = asyncio.ensure_future(_agent_coro())
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
 
-        with patch.object(api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
-            await adapter._write_sse_responses(
+        with patch.object(responses_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
+            await responses_mod.write_sse_responses(
                 request=fake_request,
                 response_id=response_id,
                 model="hermes-agent",
@@ -1754,6 +1751,7 @@ class TestResponsesStreaming:
                 conversation=None,
                 store=True,
                 session_id=None,
+                adapter=adapter,
             )
 
         stored = adapter._response_store.get(response_id)
@@ -1812,29 +1810,30 @@ class TestConfigIntegration:
         assert Platform.API_SERVER.value == "api_server"
 
     def test_env_override_enables_api_server(self, monkeypatch):
+        """API_SERVER_ENABLED env var no longer creates a gateway platform config."""
         monkeypatch.setenv("API_SERVER_ENABLED", "true")
         from gateway.config import load_gateway_config
         config = load_gateway_config()
-        assert Platform.API_SERVER in config.platforms
-        assert config.platforms[Platform.API_SERVER].enabled is True
+        assert Platform.API_SERVER not in config.platforms
 
     def test_env_override_with_key(self, monkeypatch):
-        monkeypatch.setenv("API_SERVER_KEY", "sk-mykey")
+        """API_SERVER_KEY env var no longer creates a gateway platform config."""
+        monkeypatch.setenv("API_SERVER_KEY", "sk-test")
         from gateway.config import load_gateway_config
         config = load_gateway_config()
-        assert Platform.API_SERVER in config.platforms
-        assert config.platforms[Platform.API_SERVER].extra.get("key") == "sk-mykey"
+        assert Platform.API_SERVER not in config.platforms
 
     def test_env_override_port_and_host(self, monkeypatch):
+        """API_SERVER_PORT/HOST env vars no longer create a gateway platform config."""
         monkeypatch.setenv("API_SERVER_ENABLED", "true")
         monkeypatch.setenv("API_SERVER_PORT", "9999")
         monkeypatch.setenv("API_SERVER_HOST", "0.0.0.0")
         from gateway.config import load_gateway_config
         config = load_gateway_config()
-        assert config.platforms[Platform.API_SERVER].extra.get("port") == 9999
-        assert config.platforms[Platform.API_SERVER].extra.get("host") == "0.0.0.0"
+        assert Platform.API_SERVER not in config.platforms
 
     def test_env_override_cors_origins(self, monkeypatch):
+        """API_SERVER_CORS_ORIGINS env var no longer creates a gateway platform config."""
         monkeypatch.setenv("API_SERVER_ENABLED", "true")
         monkeypatch.setenv(
             "API_SERVER_CORS_ORIGINS",
@@ -1842,10 +1841,7 @@ class TestConfigIntegration:
         )
         from gateway.config import load_gateway_config
         config = load_gateway_config()
-        assert config.platforms[Platform.API_SERVER].extra.get("cors_origins") == [
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-        ]
+        assert Platform.API_SERVER not in config.platforms
 
     def test_api_server_in_connected_platforms(self):
         config = GatewayConfig()
@@ -1902,7 +1898,7 @@ class TestSendMethod:
     @pytest.mark.asyncio
     async def test_send_returns_not_supported(self):
         config = PlatformConfig(enabled=True)
-        adapter = APIServerAdapter(config)
+        adapter = StandaloneAPIServer(config)
         result = await adapter.send("chat1", "hello")
         assert result.success is False
         assert "HTTP request/response" in result.error

@@ -4252,11 +4252,9 @@ class GatewayRunner:
             return MatrixAdapter(config)
 
         elif platform == Platform.API_SERVER:
-            from gateway.platforms.api_server import APIServerAdapter, check_api_server_requirements
-            if not check_api_server_requirements():
-                logger.warning("API Server: aiohttp not installed")
-                return None
-            return APIServerAdapter(config)
+            # API Server is now a standalone systemd service — not managed by Gateway
+            logger.info("API Server platform is disabled in Gateway mode. Use `python -m api_server` or systemd service instead.")
+            return None
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
