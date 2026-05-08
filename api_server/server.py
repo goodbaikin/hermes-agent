@@ -740,7 +740,9 @@ class StandaloneAPIServer:
         session = self._normalize_session_record(db.get_session(session_id))
         if session is None:
             db.ensure_session(session_id, source="web")
-            session = self._normalize_session_record(db.get_session(session_id)) or {}
+            session = self._normalize_session_record(db.get_session(session_id))
+            if session is None:
+                session = {"id": session_id, "title": None}
 
         try:
             body = await request.json()
@@ -815,7 +817,9 @@ class StandaloneAPIServer:
         session = self._normalize_session_record(db.get_session(session_id))
         if session is None:
             db.ensure_session(session_id, source="web")
-            session = self._normalize_session_record(db.get_session(session_id)) or {}
+            session = self._normalize_session_record(db.get_session(session_id))
+            if session is None:
+                session = {"id": session_id, "title": None}
 
         try:
             body = await request.json()
@@ -1948,6 +1952,8 @@ class StandaloneAPIServer:
 
     @staticmethod
     def _normalize_session_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        if record is None:
+            return None
         return {
             "id": record.get("id"),
             "source": record.get("source"),
@@ -2544,21 +2550,7 @@ class StandaloneAPIServer:
 
     async def _handle_ws(self, request: "web.Request") -> "web.WebSocketResponse":
         """GET /ws -- WebSocket endpoint for remote node protocol (OpenClaw-style)."""
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        logger.info("[api_server] WebSocket connection opened")
-        try:
-            async for msg in ws:
-                if msg.type == web.WSMsgType.TEXT:
-                    # Echo back for now — real node protocol would dispatch to handlers
-                    await ws.send_str(f"echo: {msg.data}")
-                elif msg.type == web.WSMsgType.ERROR:
-                    logger.error("[api_server] WebSocket error: %s", ws.exception())
-        except Exception as e:
-            logger.error("[api_server] WebSocket handler error: %s", e)
-        finally:
-            logger.info("[api_server] WebSocket connection closed")
-        return ws
+        return await self._handle_ws_real(request)
 
     async def _handle_ws_real(self, request: "web.Request") -> "web.WebSocketResponse":
         """

@@ -7,7 +7,9 @@ from aiohttp import web
 logger = logging.getLogger(__name__)
 
 
-def _normalize_session_record(record: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_session_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if record is None:
+        return None
     return {
         "id": record.get("id"),
         "source": record.get("source"),
