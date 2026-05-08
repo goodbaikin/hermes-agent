@@ -890,7 +890,7 @@ class StandaloneAPIServer:
                     {"session_id": session_id, "run_id": run_id, "message_id": assistant_message_id, "delta": delta},
                 )
 
-        def _on_tool_progress(name, preview, args):
+        def _on_tool_progress(event_type, name, preview, args):
             if name == "_thinking":
                 _queue_event(
                     "tool.progress",
@@ -905,6 +905,8 @@ class StandaloneAPIServer:
                 "args": args,
             }
             _queue_event("tool.started", payload)
+            # Also send tool.progress for progress updates
+            _queue_event("tool.progress", payload)
 
         agent_ref = [None]
         loop = asyncio.get_event_loop()
