@@ -19,7 +19,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.node_registry import NODE_REGISTRY
+from api_server.node_registry import NODE_REGISTRY
 from gateway.platforms.base import SendResult
 from api_server.middleware import cors_middleware, body_limit_middleware, security_headers_middleware, _openai_error, MAX_REQUEST_BYTES, _CORS_HEADERS, _IdempotencyCache, _idem_cache
 from api_server.sse import CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS
@@ -1218,6 +1218,13 @@ class StandaloneAPIServer:
             "platform": "hermes-agent",
             "model": "hermes-agent",
             "auth": {"type": "bearer", "required": bool(self._api_key)},
+            "runtime": {
+                "mode": "server_agent",
+                "version": "0.13.0",
+                "tool_execution": "server",
+                "split_runtime": False,
+                "description": "API-server host for Hermes Agent",
+            },
             "features": {
                 "chat_completions": True,
                 "run_status": True,
@@ -2605,7 +2612,7 @@ class StandaloneAPIServer:
                     platform = params.get("client", {}).get("platform", "unknown")
                     version = params.get("client", {}).get("version", "unknown")
 
-                    from gateway.node_registry import NodeSession
+                    from api_server.node_registry import NodeSession
 
                     def send_fn(payload: Dict[str, Any]) -> None:
                         asyncio.create_task(ws.send_str(json.dumps(payload)))

@@ -104,6 +104,7 @@ async def handle_responses(
         if previous_response_id:
             logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
+    stored = None
     stored_session_id = None
     if not conversation_history and previous_response_id:
         stored = adapter._response_store.get(previous_response_id)
@@ -190,6 +191,7 @@ async def handle_responses(
             session_id=session_id,
             adapter=adapter,
             session_key=session_key,
+            previous_response_id=previous_response_id,
         )
         return sse_response
 
@@ -234,16 +236,27 @@ async def handle_responses(
     created_at = int(time.time())
 
     # Build the full conversation history for storage
-    full_history = list(conversation_history)
-    full_history.append({"role": "user", "content": user_message})
+    # If the agent returned messages, use those directly (they contain the full history)
     agent_messages = result.get("messages", [])
     if agent_messages:
-        full_history.extend(agent_messages)
+        full_history = list(agent_messages)
     else:
+        full_history = list(conversation_history)
+        full_history.append({"role": "user", "content": user_message})
         full_history.append({"role": "assistant", "content": final_response})
 
     # Build output items (includes tool calls + final message)
-    output_items = adapter._extract_output_items(result)
+    # When using previous_response_id, only include messages from the current turn
+    if previous_response_id and conversation_history:
+        # Find where the new turn starts (after the previous conversation history)
+        prev_len = len(stored.get("conversation_history", [])) if stored else 0
+        current_messages = result.get("messages", [])[prev_len:]
+        # Create a temporary result with only current turn messages
+        temp_result = dict(result)
+        temp_result["messages"] = current_messages
+        output_items = adapter._extract_output_items(temp_result)
+    else:
+        output_items = adapter._extract_output_items(result)
 
     response_data = {
         "id": response_id,
@@ -293,6 +306,7 @@ async def write_sse_responses(
     *,
     adapter: Any,
     session_key: Optional[str] = None,
+    previous_response_id: Optional[str] = None,
 ) -> web.StreamResponse:
     """Write an SSE stream for POST /v1/responses (OpenAI Responses API)."""
     sse_headers = {
@@ -653,7 +667,13 @@ async def write_sse_responses(
             full_history = list(conversation_history)
             full_history.append({"role": "user", "content": user_message})
             if isinstance(result, dict) and result.get("messages"):
-                full_history.extend(result["messages"])
+                # When using previous_response_id, the agent returns full history
+                # We should use the agent's messages directly as they contain the complete transcript
+                if previous_response_id:
+                    # Replace with the agent's full messages (they contain the complete history)
+                    full_history = list(result["messages"])
+                else:
+                    full_history.extend(result["messages"])
             else:
                 full_history.append({"role": "assistant", "content": final_response_text})
             _persist_response_snapshot(

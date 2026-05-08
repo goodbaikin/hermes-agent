@@ -1,7 +1,7 @@
 import json
 from aiohttp import web
 
-from gateway.node_registry import NODE_REGISTRY
+from api_server.node_registry import NODE_REGISTRY
 
 
 async def handle_list_nodes(request: web.Request, *, check_auth) -> web.Response:
