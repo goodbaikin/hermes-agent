@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import socket as _socket
-import re
 import sqlite3
 import time
 import uuid
@@ -847,33 +846,8 @@ class StandaloneAPIServer:
 
     @staticmethod
     def _normalize_session_record(record: Dict[str, Any]) -> Dict[str, Any]:
-        if record is None:
-            return None
-        normalized = dict(record)
-        model_config = normalized.get("model_config")
-        if model_config:
-            try:
-                normalized["model_config"] = json.loads(model_config)
-            except (TypeError, json.JSONDecodeError):
-                pass
-        return {
-            "id": normalized.get("id") or normalized.get("session_id"),
-            "session_id": normalized.get("session_id") or normalized.get("id"),
-            "source": normalized.get("source"),
-            "user_id": normalized.get("user_id"),
-            "model": normalized.get("model"),
-            "title": normalized.get("title"),
-            "started_at": normalized.get("started_at"),
-            "ended_at": normalized.get("ended_at"),
-            "end_reason": normalized.get("end_reason"),
-            "message_count": normalized.get("message_count") or 0,
-            "tool_call_count": normalized.get("tool_call_count") or 0,
-            "input_tokens": normalized.get("input_tokens") or 0,
-            "output_tokens": normalized.get("output_tokens") or 0,
-            "last_active": normalized.get("last_active"),
-            "parent_session_id": normalized.get("parent_session_id"),
-            "model_config": normalized.get("model_config"),
-        }
+        from api_server.handlers.sessions import _normalize_session_record as _norm
+        return _norm(record)
 
     # ------------------------------------------------------------------
     # Output extraction helper
