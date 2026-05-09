@@ -144,11 +144,10 @@ async def handle_delete_session(request: web.Request, *, check_auth, ensure_sess
         if not db:
             return web.json_response({"error": "Session DB unavailable"}, status=503)
         session_id = request.match_info.get("session_id", "")
-        resolved = db.resolve_session_id(session_id) or session_id
-        ok = db.delete_session(resolved)
-        if not ok:
+        deleted = db.delete_session(session_id)
+        if not deleted:
             return web.json_response({"error": "Session not found"}, status=404)
-        return web.json_response({"ok": True, "session_id": resolved})
+        return web.json_response({"ok": True, "session_id": session_id})
     except Exception as e:
         logger.exception("Error deleting session")
         return web.json_response({"error": str(e)}, status=500)

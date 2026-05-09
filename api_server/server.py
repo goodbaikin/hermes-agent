@@ -666,54 +666,21 @@ class StandaloneAPIServer:
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id} -- delete a session."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        deleted = self._get_session_db().delete_session(session_id)
-        if not deleted:
-            return web.json_response({"error": "Session not found"}, status=404)
-        return web.json_response({"ok": True})
+        from api_server.handlers.sessions import handle_delete_session
+        return await handle_delete_session(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork -- clone a session and its messages."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        db = self._get_session_db()
-        original = db.get_session(session_id)
-        if original is None:
-            return web.json_response({"error": "Session not found"}, status=404)
-
-        forked_id = f"sess_{uuid.uuid4().hex}"
-        try:
-            db.create_session(
-                session_id=forked_id,
-                source=original.get("source") or "api_server",
-                model=original.get("model"),
-                system_prompt=original.get("system_prompt"),
-                user_id=original.get("user_id"),
-                parent_session_id=session_id,
-            )
-            messages = db.get_messages(session_id)
-            for message in messages:
-                db.append_message(
-                    session_id=forked_id,
-                    role=message.get("role"),
-                    content=message.get("content"),
-                    tool_name=message.get("tool_name"),
-                    tool_calls=message.get("tool_calls"),
-                    tool_call_id=message.get("tool_call_id"),
-                    token_count=message.get("token_count"),
-                    finish_reason=message.get("finish_reason"),
-                    reasoning=message.get("reasoning"),
-                )
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
-
-        session = self._normalize_session_record(db.get_session(forked_id))
-        return web.json_response({"session": session, "forked_from": session_id})
+        from api_server.handlers.sessions import handle_fork_session
+        return await handle_fork_session(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat -- run a session-aware chat turn."""
@@ -1038,84 +1005,39 @@ class StandaloneAPIServer:
 
     async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
         """GET /api/memory -- read current memory state."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        target = (request.query.get("target") or "all").strip().lower()
-        if target not in {"all", "memory", "user"}:
-            return web.json_response({"error": "target must be one of: all, memory, user"}, status=400)
-
-        store = self._get_memory_store()
-        store.load_from_disk()
-        targets = []
-        if target in {"all", "memory"}:
-            targets.append({
-                "target": "memory",
-                "entries": store.memory_entries,
-                "entry_count": len(store.memory_entries),
-            })
-        if target in {"all", "user"}:
-            targets.append({
-                "target": "user",
-                "entries": store.user_entries,
-                "entry_count": len(store.user_entries),
-            })
-        return web.json_response({"targets": targets})
+        from api_server.handlers.memory import handle_get_memory
+        return await handle_get_memory(
+            request,
+            check_auth=self._check_auth,
+            get_memory_store=self._get_memory_store,
+        )
 
     async def _handle_add_memory(self, request: "web.Request") -> "web.Response":
         """POST /api/memory -- add a memory entry."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        target = str(body.get("target") or "").strip().lower()
-        content = str(body.get("content") or "")
-        if target not in {"memory", "user"}:
-            return web.json_response({"error": "target must be 'memory' or 'user'"}, status=400)
-        result = self._get_memory_store().add(target, content)
-        status = 200 if result.get("success") else 400
-        return web.json_response(result, status=status)
+        from api_server.handlers.memory import handle_add_memory
+        return await handle_add_memory(
+            request,
+            check_auth=self._check_auth,
+            get_memory_store=self._get_memory_store,
+        )
 
     async def _handle_replace_memory(self, request: "web.Request") -> "web.Response":
         """PATCH /api/memory -- replace a memory entry."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        target = str(body.get("target") or "").strip().lower()
-        old_text = str(body.get("old_text") or "")
-        content = str(body.get("content") or "")
-        if target not in {"memory", "user"}:
-            return web.json_response({"error": "target must be 'memory' or 'user'"}, status=400)
-        result = self._get_memory_store().replace(target, old_text, content)
-        status = 200 if result.get("success") else 400
-        return web.json_response(result, status=status)
+        from api_server.handlers.memory import handle_replace_memory
+        return await handle_replace_memory(
+            request,
+            check_auth=self._check_auth,
+            get_memory_store=self._get_memory_store,
+        )
 
     async def _handle_delete_memory(self, request: "web.Request") -> "web.Response":
         """DELETE /api/memory -- delete a memory entry."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        target = str(body.get("target") or "").strip().lower()
-        old_text = str(body.get("old_text") or "")
-        if target not in {"memory", "user"}:
-            return web.json_response({"error": "target must be 'memory' or 'user'"}, status=400)
-        result = self._get_memory_store().remove(target, old_text)
-        status = 200 if result.get("success") else 400
-        return web.json_response(result, status=status)
+        from api_server.handlers.memory import handle_delete_memory
+        return await handle_delete_memory(
+            request,
+            check_auth=self._check_auth,
+            get_memory_store=self._get_memory_store,
+        )
 
     async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
         """GET /api/skills -- list skills."""
