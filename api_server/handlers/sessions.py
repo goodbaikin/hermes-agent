@@ -93,19 +93,26 @@ async def handle_create_session(request: web.Request, *, check_auth, ensure_sess
         return web.json_response({"error": "Invalid JSON in request body"}, status=400)
     try:
         requested_id = str(body.get("id") or "").strip()
-        session_id = requested_id or str(uuid.uuid4())
+        session_id = requested_id or f"sess_{uuid.uuid4().hex}"
         title = str(body.get("title") or "").strip() or None
+        source = str(body.get("source") or "api_server").strip() or "api_server"
         model = str(body.get("model") or "").strip() or None
+        system_prompt = str(body.get("system_prompt") or "").strip() or None
         db = ensure_session_db()
         if not db:
             return web.json_response({"error": "Session DB unavailable"}, status=503)
-        created_id = db.create_session(session_id=session_id, source="api_server", model=model)
+        created_id = db.create_session(
+            session_id=session_id,
+            source=source,
+            model=model,
+            system_prompt=system_prompt,
+        )
         if title:
             try:
                 db.set_session_title(created_id, title)
             except Exception:
                 pass
-        item = db.get_session(created_id) or {"id": created_id, "model": model, "title": title, "started_at": time.time()}
+        item = db.get_session(created_id) or {"id": created_id, "model": model, "title": title, "source": source, "started_at": time.time()}
         return web.json_response({"session": _normalize_session_record(item)})
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
@@ -125,14 +132,21 @@ async def handle_update_session(request: web.Request, *, check_auth, ensure_sess
         session_id = request.match_info.get("session_id", "")
         resolved = db.resolve_session_id(session_id) or session_id
         body = await request.json() if request.can_read_body else {}
-        title = str(body.get("title") or "").strip()
-        if not title:
-            return web.json_response({"error": "title required"}, status=400)
-        ok = db.set_session_title(resolved, title)
-        if not ok:
-            return web.json_response({"error": "Session not found"}, status=404)
+        if "title" in body:
+            title = str(body.get("title") or "").strip()
+            if not title:
+                return web.json_response({"error": "title required"}, status=400)
+            ok = db.set_session_title(resolved, title)
+            if not ok:
+                return web.json_response({"error": "Session not found"}, status=404)
+        if "system_prompt" in body:
+            db.update_system_prompt(resolved, str(body.get("system_prompt") or "").strip())
+        if "end_reason" in body:
+            db.end_session(resolved, str(body.get("end_reason") or "updated"))
         item = db.get_session(resolved)
-        return web.json_response({"session": _normalize_session_record(item or {"id": resolved, "title": title})})
+        return web.json_response({"session": _normalize_session_record(item or {"id": resolved})})
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     except Exception as e:
         logger.exception("Error updating session")
         return web.json_response({"error": str(e)}, status=500)
@@ -213,3 +227,27 @@ async def handle_fork_session(request: web.Request, *, check_auth, ensure_sessio
 
     session = _normalize_session_record(db.get_session(forked_id))
     return web.json_response({"session": session, "forked_from": session_id})
+
+
+async def handle_search_sessions(request: web.Request, *, check_auth, ensure_session_db) -> web.Response:
+    """GET /api/sessions/search -- search messages across sessions."""
+    auth_err = check_auth(request)
+    if auth_err:
+        return auth_err
+    query = (request.query.get("q") or "").strip()
+    if not query:
+        return web.json_response({"error": "Missing query parameter: q"}, status=400)
+    try:
+        db = ensure_session_db()
+        if not db:
+            return web.json_response({"items": [], "total": 0})
+        from api_server.utils import _parse_int
+        limit = _parse_int(request.query.get("limit"), 20)
+        offset = _parse_int(request.query.get("offset"), 0)
+        results = db.search_messages(query=query, limit=limit, offset=offset)
+        return web.json_response({"query": query, "count": len(results), "results": results})
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except Exception as e:
+        logger.exception("Error searching sessions")
+        return web.json_response({"error": str(e)}, status=500)

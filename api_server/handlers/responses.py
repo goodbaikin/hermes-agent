@@ -718,3 +718,35 @@ async def write_sse_responses(
     if session_key:
         response.headers["X-Hermes-Session-Key"] = session_key
     return response
+
+
+async def handle_get_response(request: web.Request, *, check_auth, response_store) -> web.Response:
+    """GET /v1/responses/{response_id} -- retrieve a stored response."""
+    auth_err = check_auth(request)
+    if auth_err:
+        return auth_err
+
+    response_id = request.match_info["response_id"]
+    stored = response_store.get(response_id)
+    if stored is None:
+        return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
+
+    return web.json_response(stored["response"])
+
+
+async def handle_delete_response(request: web.Request, *, check_auth, response_store) -> web.Response:
+    """DELETE /v1/responses/{response_id} -- delete a stored response."""
+    auth_err = check_auth(request)
+    if auth_err:
+        return auth_err
+
+    response_id = request.match_info["response_id"]
+    deleted = response_store.delete(response_id)
+    if not deleted:
+        return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
+
+    return web.json_response({
+        "id": response_id,
+        "object": "response",
+        "deleted": True,
+    })

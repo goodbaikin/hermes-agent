@@ -265,3 +265,54 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     """Stable hash for idempotency cache lookup."""
     subset = {k: body.get(k) for k in keys}
     return hashlib.sha256(json.dumps(subset, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _build_user_content(
+    text: str, attachments: Optional[List[Dict[str, Any]]] = None
+) -> tuple:
+    """Build multimodal content from text + image attachments.
+
+    Returns (user_content, persist_text) where user_content is either
+    a plain string or a list of content parts for multimodal input.
+    """
+    if not attachments:
+        return text, text
+
+    image_parts: List[Dict[str, Any]] = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        mime = ""
+        for key in ("contentType", "mimeType", "mediaType"):
+            val = att.get(key)
+            if isinstance(val, str) and val.strip():
+                mime = val.strip()
+                break
+        if not mime.startswith("image/"):
+            continue
+        content = ""
+        for key in ("content", "base64", "data"):
+            val = att.get(key)
+            if isinstance(val, str) and val.strip():
+                content = val.strip()
+                break
+        if not content:
+            # Try dataUrl format: data:image/png;base64,...
+            data_url = att.get("dataUrl", "")
+            if isinstance(data_url, str) and data_url.startswith("data:"):
+                content = data_url.split(",", 1)[-1] if "," in data_url else ""
+        if not content:
+            continue
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{content}"},
+        })
+
+    if not image_parts:
+        return text, text
+
+    content_parts: List[Dict[str, Any]] = []
+    if text.strip():
+        content_parts.append({"type": "text", "text": text})
+    content_parts.extend(image_parts)
+    return content_parts, text

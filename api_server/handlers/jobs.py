@@ -25,10 +25,10 @@ except ImportError:
     _cron_resume = None
     _cron_trigger = None
 
-_MAX_NAME_LENGTH = 100
+_MAX_NAME_LENGTH = 200
 _MAX_PROMPT_LENGTH = 5000
-_UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "repeat"}
-_JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+_JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
 
 
 def _check_jobs_available() -> Optional[web.Response]:

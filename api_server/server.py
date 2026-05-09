@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import hmac
 import json
 import logging
@@ -386,52 +385,9 @@ class StandaloneAPIServer:
     def _build_user_content(
         text: str, attachments: Optional[List[Dict[str, Any]]] = None
     ) -> tuple:
-        """Build multimodal content from text + image attachments.
-
-        Returns (user_content, persist_text) where user_content is either
-        a plain string or a list of content parts for multimodal input.
-        """
-        if not attachments:
-            return text, text
-
-        image_parts: List[Dict[str, Any]] = []
-        for att in attachments:
-            if not isinstance(att, dict):
-                continue
-            mime = ""
-            for key in ("contentType", "mimeType", "mediaType"):
-                val = att.get(key)
-                if isinstance(val, str) and val.strip():
-                    mime = val.strip()
-                    break
-            if not mime.startswith("image/"):
-                continue
-            content = ""
-            for key in ("content", "base64", "data"):
-                val = att.get(key)
-                if isinstance(val, str) and val.strip():
-                    content = val.strip()
-                    break
-            if not content:
-                # Try dataUrl format: data:image/png;base64,...
-                data_url = att.get("dataUrl", "")
-                if isinstance(data_url, str) and data_url.startswith("data:"):
-                    content = data_url.split(",", 1)[-1] if "," in data_url else ""
-            if not content:
-                continue
-            image_parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{content}"},
-            })
-
-        if not image_parts:
-            return text, text
-
-        content_parts: List[Dict[str, Any]] = []
-        if text.strip():
-            content_parts.append({"type": "text", "text": text})
-        content_parts.extend(image_parts)
-        return content_parts, text
+        """Build multimodal content from text + image attachments."""
+        from api_server.utils import _build_user_content as _build
+        return _build(text, attachments)
 
     def _create_agent(
         self,
@@ -495,49 +451,18 @@ class StandaloneAPIServer:
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health -- simple health check."""
-        return web.json_response({"status": "ok", "platform": "hermes-agent"})
+        from api_server.handlers.health import handle_health
+        return await handle_health(request)
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
-        """GET /health/detailed -- rich status for cross-container dashboard probing.
-
-        Returns gateway state, connected platforms, PID, and uptime so the
-        dashboard can display full status without needing a shared PID file or
-        /proc access.  No authentication required.
-        """
-        from gateway.status import read_runtime_status
-
-        runtime = read_runtime_status() or {}
-        return web.json_response({
-            "status": "ok",
-            "platform": "hermes-agent",
-            "gateway_state": runtime.get("gateway_state"),
-            "platforms": runtime.get("platforms", {}),
-            "active_agents": runtime.get("active_agents", 0),
-            "exit_reason": runtime.get("exit_reason"),
-            "updated_at": runtime.get("updated_at"),
-            "pid": os.getpid(),
-        })
+        """GET /health/detailed -- rich status for cross-container dashboard probing."""
+        from api_server.handlers.health import handle_health_detailed
+        return await handle_health_detailed(request)
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models -- return hermes-agent as an available model."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        return web.json_response({
-            "object": "list",
-            "data": [
-                {
-                    "id": self._model_name,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": self._model_name,
-                    "parent": None,
-                }
-            ],
-        })
+        from api_server.handlers.models import handle_models
+        return await handle_models(request, check_auth=self._check_auth, model_name=self._model_name)
 
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
@@ -551,54 +476,21 @@ class StandaloneAPIServer:
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions -- create a new session."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        title = body.get("title")
-        source = str(body.get("source") or "api_server").strip() or "api_server"
-        model = body.get("model")
-        system_prompt = body.get("system_prompt")
-        session_id = f"sess_{uuid.uuid4().hex}"
-        db = self._get_session_db()
-
-        try:
-            db.create_session(
-                session_id=session_id,
-                source=source,
-                model=model,
-                system_prompt=system_prompt,
-            )
-            if title is not None:
-                db.set_session_title(session_id, str(title))
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
-
-        session = self._normalize_session_record(db.get_session(session_id))
-        return web.json_response({"session": session})
+        from api_server.handlers.sessions import handle_create_session
+        return await handle_create_session(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_search_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/search -- search messages across sessions."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        query = (request.query.get("q") or "").strip()
-        if not query:
-            return web.json_response({"error": "Missing query parameter: q"}, status=400)
-        try:
-            limit = self._parse_int(request.query.get("limit"), 20)
-            offset = self._parse_int(request.query.get("offset"), 0)
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-
-        results = self._get_session_db().search_messages(query=query, limit=limit, offset=offset)
-        return web.json_response({"query": query, "count": len(results), "results": results})
+        from api_server.handlers.sessions import handle_search_sessions
+        return await handle_search_sessions(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id} -- fetch one session."""
@@ -620,32 +512,12 @@ class StandaloneAPIServer:
 
     async def _handle_update_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} -- update a session."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        db = self._get_session_db()
-        if db.get_session(session_id) is None:
-            return web.json_response({"error": "Session not found"}, status=404)
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        try:
-            if "title" in body:
-                db.set_session_title(session_id, body.get("title"))
-            if "system_prompt" in body:
-                db.update_system_prompt(session_id, body.get("system_prompt"))
-            if "end_reason" in body:
-                db.end_session(session_id, str(body.get("end_reason") or "updated"))
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
-
-        session = self._normalize_session_record(db.get_session(session_id))
-        return web.json_response({"session": session})
+        from api_server.handlers.sessions import handle_update_session
+        return await handle_update_session(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id} -- delete a session."""
@@ -667,324 +539,28 @@ class StandaloneAPIServer:
 
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat -- run a session-aware chat turn."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        session_id = request.match_info["session_id"]
-        db = self._get_session_db()
-        session = self._normalize_session_record(db.get_session(session_id))
-        if session is None:
-            db.ensure_session(session_id, source="web")
-            session = self._normalize_session_record(db.get_session(session_id))
-            if session is None:
-                session = {"id": session_id, "title": None}
-
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        message = body.get("message")
-        if not isinstance(message, str):
-            return web.json_response({"error": "Missing or invalid 'message' field"}, status=400)
-
-        raw_attachments_sync = body.get("attachments")
-        if raw_attachments_sync:
-            logger.debug("[chat] Received %d attachment(s): %s",
-                         len(raw_attachments_sync),
-                         [(a.get("name"), a.get("contentType"), len(a.get("content", "") or a.get("base64", "") or "")) for a in raw_attachments_sync if isinstance(a, dict)])
-        user_content, persist_text = self._build_user_content(message, raw_attachments_sync)
-        if isinstance(user_content, list):
-            logger.debug("[chat] Built multimodal content with %d parts", len(user_content))
-
-        model = body.get("model") or session.get("model") or "hermes-agent"
-        system_message = body.get("system_message")
-        history = db.get_messages_as_conversation(session_id)
-        loop = asyncio.get_event_loop()
-
-        def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=system_message,
-                session_id=session_id,
-            )
-            agent._session_db = db  # Enable session persistence
-            result = agent.run_conversation(
-                user_content,
-                conversation_history=history,
-                persist_user_message=persist_text,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            return result, usage
-
-        try:
-            result, usage = await loop.run_in_executor(None, _run)
-        except Exception as e:
-            logger.error("Error running session chat for %s: %s", session_id, e, exc_info=True)
-            return web.json_response({"error": str(e)}, status=500)
-
-        return web.json_response({
-            "session_id": session_id,
-            "run_id": f"run_{uuid.uuid4().hex}",
-            "model": model,
-            "final_response": result.get("final_response"),
-            "completed": result.get("completed", False),
-            "partial": result.get("partial", False),
-            "interrupted": result.get("interrupted", False),
-            "api_calls": result.get("api_calls", 0),
-            "messages": result.get("messages", []),
-            "last_reasoning": result.get("last_reasoning"),
-            "response_previewed": result.get("response_previewed", False),
-            "usage": usage,
-        })
+        from api_server.handlers.session_chat import handle_session_chat
+        return await handle_session_chat(
+            request,
+            check_auth=self._check_auth,
+            get_session_db=self._get_session_db,
+            normalize_session_record=self._normalize_session_record,
+            build_user_content=self._build_user_content,
+            create_agent=self._create_agent,
+        )
 
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream -- stream a session chat turn over SSE."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        session_id = request.match_info["session_id"]
-        db = self._get_session_db()
-        session = self._normalize_session_record(db.get_session(session_id))
-        if session is None:
-            db.ensure_session(session_id, source="web")
-            session = self._normalize_session_record(db.get_session(session_id))
-            if session is None:
-                session = {"id": session_id, "title": None}
-
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        message = body.get("message")
-        if not isinstance(message, str):
-            return web.json_response({"error": "Missing or invalid 'message' field"}, status=400)
-
-        # Build multimodal content if image attachments are present
-        raw_attachments = body.get("attachments")
-        if raw_attachments:
-            logger.debug("[chat/stream] Received %d attachment(s): %s",
-                         len(raw_attachments),
-                         [(a.get("name"), a.get("contentType"), len(a.get("content", "") or a.get("base64", "") or "")) for a in raw_attachments if isinstance(a, dict)])
-        user_content, persist_text = self._build_user_content(message, raw_attachments)
-        if isinstance(user_content, list):
-            logger.debug("[chat/stream] Built multimodal content with %d parts", len(user_content))
-
-        system_message = body.get("system_message")
-        history = db.get_messages_as_conversation(session_id)
-        assistant_message_id = f"msg_asst_{uuid.uuid4().hex}"
-
-        # Note: user message persistence is handled by AIAgent._flush_messages_to_session_db
-        # Don't double-persist here or messages will appear twice
-
-        import queue as _q
-        stream_q: _q.Queue = _q.Queue()
-
-        def _encode_sse(event_name: str, payload: Dict[str, Any]) -> bytes:
-            return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-
-        def _queue_event(event_name: str, payload: Dict[str, Any]) -> None:
-            stream_q.put(_encode_sse(event_name, payload))
-
-        def _tool_map(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-            mapping: Dict[str, Dict[str, Any]] = {}
-            for item in messages:
-                if item.get("role") != "assistant":
-                    continue
-                for index, tool_call in enumerate(item.get("tool_calls") or []):
-                    tool_id = tool_call.get("id")
-                    if not tool_id:
-                        continue
-                    fn = tool_call.get("function") or {}
-                    raw_args = fn.get("arguments")
-                    try:
-                        parsed_args = json.loads(raw_args) if isinstance(raw_args, str) and raw_args.strip() else {}
-                    except json.JSONDecodeError:
-                        parsed_args = raw_args
-                    mapping[tool_id] = {
-                        "tool_name": fn.get("name") or item.get("tool_name") or f"tool_{index + 1}",
-                        "args": parsed_args,
-                    }
-            return mapping
-
-        def _result_preview(content: Any, limit: int = 4000) -> str:
-            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-            return text[:limit] + ("..." if len(text) > limit else "")
-
-        run_id = f"run_{uuid.uuid4().hex}"
-
-        def _on_delta(delta):
-            if delta:
-                _queue_event(
-                    "assistant.delta",
-                    {"session_id": session_id, "run_id": run_id, "message_id": assistant_message_id, "delta": delta},
-                )
-
-        def _on_tool_progress(event_type, name, preview, args):
-            if name == "_thinking":
-                _queue_event(
-                    "tool.progress",
-                    {"session_id": session_id, "run_id": run_id, "message_id": assistant_message_id, "delta": preview},
-                )
-                return
-            payload = {
-                "session_id": session_id,
-                "run_id": run_id,
-                "tool_name": name,
-                "preview": preview,
-                "args": args,
-            }
-            _queue_event("tool.started", payload)
-            # Also send tool.progress for progress updates
-            _queue_event("tool.progress", payload)
-
-        agent_ref = [None]
-        loop = asyncio.get_event_loop()
-
-        async def _run_agent_task():
-            def _run():
-                agent = self._create_agent(
-                    ephemeral_system_prompt=system_message,
-                    session_id=session_id,
-                    stream_delta_callback=_on_delta,
-                    tool_progress_callback=_on_tool_progress,
-                )
-                agent._session_db = db  # Enable session persistence
-                agent_ref[0] = agent
-                return agent.run_conversation(
-                    user_content,
-                    conversation_history=history,
-                    persist_user_message=persist_text,
-                )
-
-            return await loop.run_in_executor(None, _run)
-
-        agent_task = asyncio.ensure_future(_run_agent_task())
-
-        sse_headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-        origin = request.headers.get("Origin", "")
-        cors = self._cors_headers_for_origin(origin) if origin else None
-        if cors:
-            sse_headers.update(cors)
-
-        response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
-
-        try:
-            user_message_id = f"msg_user_{uuid.uuid4().hex}"
-            await response.write(_encode_sse("session.created", {
-                "session_id": session_id,
-                "run_id": run_id,
-                "title": session.get("title") or "New Chat",
-            }))
-            await response.write(_encode_sse("run.started", {
-                "session_id": session_id,
-                "run_id": run_id,
-                "user_message": {
-                    "id": user_message_id,
-                    "role": "user",
-                    "content": message,
-                },
-            }))
-            await response.write(_encode_sse("message.started", {
-                "session_id": session_id,
-                "run_id": run_id,
-                "message": {"id": assistant_message_id, "role": "assistant"},
-            }))
-
-            last_activity = time.monotonic()
-            while True:
-                try:
-                    frame = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
-                except _q.Empty:
-                    if agent_task.done():
-                        while True:
-                            try:
-                                frame = stream_q.get_nowait()
-                                if frame is None:
-                                    break
-                                await response.write(frame)
-                            except _q.Empty:
-                                break
-                        break
-                    # Send periodic keepalive to prevent client/proxy
-                    # timeouts during agent init and long LLM API calls.
-                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
-                        await response.write(b": keepalive\n\n")
-                        last_activity = time.monotonic()
-                    continue
-
-                if frame is None:
-                    break
-
-                await response.write(frame)
-                last_activity = time.monotonic()
-
-            try:
-                result = await agent_task
-            except Exception:
-                result = {"messages": [], "final_response": "", "completed": False}
-            tools = _tool_map(result.get("messages") or [])
-            for item in result.get("messages") or []:
-                if item.get("role") != "tool":
-                    continue
-                tool_id = item.get("tool_call_id")
-                tool_meta = tools.get(tool_id, {})
-                await response.write(_encode_sse("tool.completed", {
-                    "session_id": session_id,
-                    "run_id": run_id,
-                    "tool_call_id": tool_id,
-                    "tool_name": tool_meta.get("tool_name") or item.get("tool_name") or "unknown",
-                    "args": tool_meta.get("args"),
-                    "result_preview": _result_preview(item.get("content")),
-                }))
-
-            await response.write(_encode_sse("assistant.completed", {
-                "session_id": session_id,
-                "run_id": run_id,
-                "message_id": assistant_message_id,
-                "content": result.get("final_response") or "",
-                "completed": result.get("completed", False),
-                "partial": result.get("partial", False),
-                "interrupted": result.get("interrupted", False),
-            }))
-            await response.write(_encode_sse("run.completed", {
-                "session_id": session_id,
-                "run_id": run_id,
-                "message_id": assistant_message_id,
-                "completed": result.get("completed", False),
-                "partial": result.get("partial", False),
-                "interrupted": result.get("interrupted", False),
-                "api_calls": result.get("api_calls"),
-            }))
-            await response.write(_encode_sse("done", {"session_id": session_id, "run_id": run_id, "state": "final"}))
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            agent = agent_ref[0]
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("Session SSE client disconnected; interrupted session %s", session_id)
-
-        return response
+        from api_server.handlers.session_chat import handle_session_chat_stream
+        return await handle_session_chat_stream(
+            request,
+            check_auth=self._check_auth,
+            get_session_db=self._get_session_db,
+            normalize_session_record=self._normalize_session_record,
+            build_user_content=self._build_user_content,
+            create_agent=self._create_agent,
+            cors_headers_for_origin=self._cors_headers_for_origin,
+        )
 
     async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
         """GET /api/memory -- read current memory state."""
@@ -1044,49 +620,8 @@ class StandaloneAPIServer:
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities -- list available toolsets and reasoning modes."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        # Collect available toolsets from config.yaml
-        from hermes_cli.tools_config import _get_platform_tools
-        from hermes_cli.config import load_config
-
-        config = load_config()
-        toolsets = sorted(_get_platform_tools(config, "api_server"))
-
-        # Reasoning modes
-        reasoning_modes = ["disabled", "enabled", "auto"]
-
-        return web.json_response({
-            "object": "hermes.api_server.capabilities",
-            "platform": "hermes-agent",
-            "model": "hermes-agent",
-            "auth": {"type": "bearer", "required": bool(self._api_key)},
-            "runtime": {
-                "mode": "server_agent",
-                "version": "0.13.0",
-                "tool_execution": "server",
-                "split_runtime": False,
-                "description": "API-server host for Hermes Agent",
-            },
-            "features": {
-                "chat_completions": True,
-                "run_status": True,
-                "run_events_sse": True,
-                "session_continuity_header": "X-Hermes-Session-Id",
-                "session_key_header": "X-Hermes-Session-Key",
-            },
-            "endpoints": {
-                "run_status": {"path": "/v1/runs/{run_id}"},
-            },
-            "toolsets": toolsets,
-            "reasoning_modes": reasoning_modes,
-            "supports_streaming": True,
-            "supports_multimodal": True,
-            "supports_responses_api": True,
-            "supports_runs_api": True,
-        })
+        from api_server.handlers.capabilities import handle_capabilities
+        return await handle_capabilities(request, check_auth=self._check_auth, api_key=self._api_key)
     async def _handle_available_models(self, request: "web.Request") -> "web.Response":
         """GET /api/available-models -- list provider models and available providers."""
         from api_server.handlers.config import handle_available_models
@@ -1099,282 +634,12 @@ class StandaloneAPIServer:
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions -- OpenAI Chat Completions format."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        session_key, err = self._parse_session_key_header(request)
-        if err:
-            return err
-
-        # Parse request body
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
-
-        messages = body.get("messages")
-        if not messages or not isinstance(messages, list):
-            return web.json_response(
-                {"error": {"message": "Missing or invalid 'messages' field", "type": "invalid_request_error"}},
-                status=400,
-            )
-
-        # Fast-path for capability probes (max_tokens=1)
-        # Return a minimal valid response so frontends detect the endpoint
-        # without spinning up a full agent.
-        max_tokens = body.get("max_tokens")
-        if max_tokens == 1:
-            return web.json_response({
-                "id": f"chatcmpl-probe-{uuid.uuid4().hex[:8]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": body.get("model", "") or "hermes-agent",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1},
-            })
-
-        stream = body.get("stream", False)
-
-        # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
-        system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
-
-        for idx, msg in enumerate(messages):
-            role = msg.get("role", "")
-            raw_content = msg.get("content", "")
-            if role == "system":
-                # System messages don't support images (Anthropic rejects, OpenAI
-                # text-model systems don't render them).  Flatten to text.
-                content = _normalize_chat_content(raw_content)
-                if system_prompt is None:
-                    system_prompt = content
-                else:
-                    system_prompt = system_prompt + "\n" + content
-            elif role in ("user", "assistant"):
-                try:
-                    content = _normalize_multimodal_content(raw_content)
-                except ValueError as exc:
-                    return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
-                conversation_messages.append({"role": role, "content": content})
-
-        # Extract the last user message as the primary input
-        user_message: Any = ""
-        history = []
-        if conversation_messages:
-            user_message = conversation_messages[-1].get("content", "")
-            history = conversation_messages[:-1]
-
-        if not _content_has_visible_payload(user_message):
-            return web.json_response(
-                {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
-                status=400,
-            )
-
-        # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
-        #
-        # Security: session continuation exposes conversation history, so it is
-        # only allowed when the API key is configured and the request is
-        # authenticated.  Without this gate, any unauthenticated client could
-        # read arbitrary session history by guessing/enumerating session IDs.
-        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
-            if not self._api_key:
-                logger.warning(
-                    "Session continuation via X-Hermes-Session-Id rejected: "
-                    "no API key configured.  Set API_SERVER_KEY to enable "
-                    "session continuity."
-                )
-                return web.json_response(
-                    _openai_error(
-                        "Session continuation requires API key authentication. "
-                        "Configure API_SERVER_KEY to enable this feature."
-                    ),
-                    status=403,
-                )
-            # Sanitize: reject control characters that could enable header injection.
-            if re.search(r'[\r\n\x00]', provided_session_id):
-                return web.json_response(
-                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
-                    status=400,
-                )
-            session_id = provided_session_id
-            try:
-                db = self._ensure_session_db()
-                if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
-        else:
-            # Derive a stable session ID from the conversation fingerprint so
-            # that consecutive messages from the same Open WebUI (or similar)
-            # conversation map to the same Hermes session.  The first user
-            # message + system prompt are constant across all turns.
-            first_user = ""
-            for cm in conversation_messages:
-                if cm.get("role") == "user":
-                    first_user = cm.get("content", "")
-                    break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
-            # history already set from request body above
-
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", self._model_name)
-        created = int(time.time())
-
-        if stream:
-            import queue as _q
-            _stream_q: _q.Queue = _q.Queue()
-
-            def _on_delta(delta):
-                # Filter out None -- the agent fires stream_delta_callback(None)
-                # to signal the CLI display to close its response box before
-                # tool execution, but the SSE writer uses None as end-of-stream
-                # sentinel.  Forwarding it would prematurely close the HTTP
-                # response, causing Open WebUI (and similar frontends) to miss
-                # the final answer after tool calls.  The SSE loop detects
-                # completion via agent_task.done() instead.
-                if delta is not None:
-                    _stream_q.put(delta)
-
-            # Track which tool_call_ids we've emitted a "running" lifecycle
-            # event for, so a "completed" event without a matching "running"
-            # (e.g. internal/filtered tools) is silently dropped instead of
-            # producing an orphaned event clients can't correlate.
-            _started_tool_call_ids: set[str] = set()
-
-            def _on_tool_start(tool_call_id, function_name, function_args):
-                """Emit ``hermes.tool.progress`` with ``status: running``.
-
-                Replaces the old ``tool_progress_callback("tool.started",
-                ...)`` emit so SSE consumers receive a single event per
-                tool start, carrying both the legacy ``tool``/``emoji``/
-                ``label`` payload (for #6972 frontends) and the new
-                ``toolCallId``/``status`` correlation fields (#16588).
-
-                Skips tools whose names start with ``_`` so internal
-                events (``_thinking``, …) stay off the wire -- matching
-                the prior ``_on_tool_progress`` filter exactly.
-                """
-                if not tool_call_id or function_name.startswith("_"):
-                    return
-                _started_tool_call_ids.add(tool_call_id)
-                from agent.display import build_tool_preview, get_tool_emoji
-                label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "emoji": get_tool_emoji(function_name),
-                    "label": label,
-                    "toolCallId": tool_call_id,
-                    "status": "running",
-                }))
-
-            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-                """Emit the matching ``status: completed`` event.
-
-                Dropped if the start was filtered (internal tool, missing
-                id, or never seen) so clients never get an orphaned
-                ``completed`` they can't correlate to a prior ``running``.
-                """
-                if not tool_call_id or tool_call_id not in _started_tool_call_ids:
-                    return
-                _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "toolCallId": tool_call_id,
-                    "status": "completed",
-                }))
-
-            # Start agent in background.  agent_ref is a mutable container
-            # so the SSE writer can interrupt the agent on client disconnect.
-            #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
-            # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry the
-            # tool_call id), so they own the chat-completions SSE channel.
-            agent_ref = [None]
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                gateway_session_key=request.headers.get("X-Hermes-Session-Key"),
-                stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-            ))
-
-            return await self._write_sse_chat_completion(
-                request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
-            )
-
-        # Non-streaming: run the agent (with optional Idempotency-Key)
-        async def _compute_completion():
-            return await self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                gateway_session_key=request.headers.get("X-Hermes-Session-Key"),
-            )
-
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
-            try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
-        else:
-            try:
-                result, usage = await _compute_completion()
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
-
-        final_response = result.get("final_response", "")
-        if not final_response:
-            final_response = result.get("error", "(No response generated)")
-
-        response_data = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_response,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-        }
-
-        headers = {"X-Hermes-Session-Id": session_id}
-        session_key = request.headers.get("X-Hermes-Session-Key")
-        if session_key:
-            headers["X-Hermes-Session-Key"] = session_key
-        return web.json_response(response_data, headers=headers)
+        from api_server.handlers.chat_completions import handle_chat_completions
+        return await handle_chat_completions(
+            request,
+            adapter=self,
+            idem_cache=_idem_cache,
+        )
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -1516,252 +781,65 @@ class StandaloneAPIServer:
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} -- retrieve a stored response."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        response_id = request.match_info["response_id"]
-        stored = self._response_store.get(response_id)
-        if stored is None:
-            return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
-
-        return web.json_response(stored["response"])
+        from api_server.handlers.responses import handle_get_response
+        return await handle_get_response(
+            request,
+            check_auth=self._check_auth,
+            response_store=self._response_store,
+        )
 
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/responses/{response_id} -- delete a stored response."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        response_id = request.match_info["response_id"]
-        deleted = self._response_store.delete(response_id)
-        if not deleted:
-            return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
-
-        return web.json_response({
-            "id": response_id,
-            "object": "response",
-            "deleted": True,
-        })
+        from api_server.handlers.responses import handle_delete_response
+        return await handle_delete_response(
+            request,
+            check_auth=self._check_auth,
+            response_store=self._response_store,
+        )
 
     # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
 
-    _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
-    # Allowed fields for update -- prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
-    _MAX_NAME_LENGTH = 200
-    _MAX_PROMPT_LENGTH = 5000
-
-    @staticmethod
-    def _check_jobs_available() -> Optional["web.Response"]:
-        """Return error response if cron module isn't available."""
-        if not _CRON_AVAILABLE:
-            return web.json_response(
-                {"error": "Cron module not available"}, status=501,
-            )
-        return None
-
-    def _check_job_id(self, request: "web.Request") -> tuple:
-        """Validate and extract job_id. Returns (job_id, error_response)."""
-        job_id = request.match_info["job_id"]
-        if not self._JOB_ID_RE.fullmatch(job_id):
-            return job_id, web.json_response(
-                {"error": "Invalid job ID format"}, status=400,
-            )
-        return job_id, None
-
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs -- list all cron jobs."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        try:
-            include_disabled = request.query.get("include_disabled", "").lower() in ("true", "1")
-            jobs = _cron_list(include_disabled=include_disabled)
-            return web.json_response({"jobs": jobs})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_list_jobs
+        return await handle_list_jobs(request, check_auth=self._check_auth)
 
     async def _handle_create_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs -- create a new cron job."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        try:
-            body = await request.json()
-            name = (body.get("name") or "").strip()
-            schedule = (body.get("schedule") or "").strip()
-            prompt = body.get("prompt", "")
-            deliver = body.get("deliver", "local")
-            skills = body.get("skills")
-            repeat = body.get("repeat")
-
-            if not name:
-                return web.json_response({"error": "Name is required"}, status=400)
-            if len(name) > self._MAX_NAME_LENGTH:
-                return web.json_response(
-                    {"error": f"Name must be ≤ {self._MAX_NAME_LENGTH} characters"}, status=400,
-                )
-            if not schedule:
-                return web.json_response({"error": "Schedule is required"}, status=400)
-            if len(prompt) > self._MAX_PROMPT_LENGTH:
-                return web.json_response(
-                    {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
-                )
-            if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
-                return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
-
-            kwargs = {
-                "prompt": prompt,
-                "schedule": schedule,
-                "name": name,
-                "deliver": deliver,
-            }
-            if skills:
-                kwargs["skills"] = skills
-            if repeat is not None:
-                kwargs["repeat"] = repeat
-
-            job = _cron_create(**kwargs)
-            return web.json_response({"job": job})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_create_job
+        return await handle_create_job(request, check_auth=self._check_auth)
 
     async def _handle_get_job(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/{job_id} -- get a single cron job."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        job_id, id_err = self._check_job_id(request)
-        if id_err:
-            return id_err
-        try:
-            job = _cron_get(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_get_job
+        return await handle_get_job(request, check_auth=self._check_auth)
 
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} -- update a cron job."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        job_id, id_err = self._check_job_id(request)
-        if id_err:
-            return id_err
-        try:
-            body = await request.json()
-            # Whitelist allowed fields to prevent arbitrary key injection
-            sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
-            if not sanitized:
-                return web.json_response({"error": "No valid fields to update"}, status=400)
-            # Validate lengths if present
-            if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
-                return web.json_response(
-                    {"error": f"Name must be ≤ {self._MAX_NAME_LENGTH} characters"}, status=400,
-                )
-            if "prompt" in sanitized and len(sanitized["prompt"]) > self._MAX_PROMPT_LENGTH:
-                return web.json_response(
-                    {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
-                )
-            job = _cron_update(job_id, sanitized)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_update_job
+        return await handle_update_job(request, check_auth=self._check_auth)
 
     async def _handle_delete_job(self, request: "web.Request") -> "web.Response":
         """DELETE /api/jobs/{job_id} -- delete a cron job."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        job_id, id_err = self._check_job_id(request)
-        if id_err:
-            return id_err
-        try:
-            success = _cron_remove(job_id)
-            if not success:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"ok": True})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_delete_job
+        return await handle_delete_job(request, check_auth=self._check_auth)
 
     async def _handle_pause_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/pause -- pause a cron job."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        job_id, id_err = self._check_job_id(request)
-        if id_err:
-            return id_err
-        try:
-            job = _cron_pause(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_pause_job
+        return await handle_pause_job(request, check_auth=self._check_auth)
 
     async def _handle_resume_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/resume -- resume a paused cron job."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        job_id, id_err = self._check_job_id(request)
-        if id_err:
-            return id_err
-        try:
-            job = _cron_resume(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_resume_job
+        return await handle_resume_job(request, check_auth=self._check_auth)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/run -- trigger immediate execution."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        cron_err = self._check_jobs_available()
-        if cron_err:
-            return cron_err
-        job_id, id_err = self._check_job_id(request)
-        if id_err:
-            return id_err
-        try:
-            job = _cron_trigger(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+        from api_server.handlers.jobs import handle_run_job
+        return await handle_run_job(request, check_auth=self._check_auth)
 
     # ------------------------------------------------------------------
     # Read-only / metadata APIs for web UIs
@@ -2169,109 +1247,8 @@ class StandaloneAPIServer:
 
     async def _handle_ws(self, request: "web.Request") -> "web.WebSocketResponse":
         """GET /ws -- WebSocket endpoint for remote node protocol (OpenClaw-style)."""
-        return await self._handle_ws_real(request)
-
-    async def _handle_ws_real(self, request: "web.Request") -> "web.WebSocketResponse":
-        """
-        WebSocket endpoint for remote node connections.
-
-        OpenClaw-style protocol:
-        1. Node sends {type:"req", method:"connect", params:{role:"node", ...}}
-        2. Gateway responds {type:"res", ok:true, payload:{type:"hello-ok", ...}}
-        3. Gateway sends {type:"event", event:"node.invoke.request", payload:{...}}
-        4. Node responds {type:"event", event:"node.invoke.result", payload:{...}}
-        """
-        if not AIOHTTP_AVAILABLE or web is None:
-            return web.Response(status=503, text="aiohttp not available")
-
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        node_session = None
-        node_id = None
-
-        try:
-            async for msg in ws:
-                if msg.type != web.WSMsgType.TEXT:
-                    continue
-
-                try:
-                    data = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    continue
-
-                msg_type = data.get("type")
-                event = data.get("event")
-
-                # --- Handshake ---
-                if msg_type == "req" and data.get("method") == "connect":
-                    params = data.get("params", {})
-                    role = params.get("role", "")
-                    if role != "node":
-                        await ws.send_str(json.dumps({
-                            "type": "res",
-                            "id": data.get("id"),
-                            "ok": False,
-                            "error": {"message": "Only 'node' role is supported on /ws"},
-                        }))
-                        await ws.close()
-                        return ws
-
-                    node_id = params.get("client", {}).get("id", "unknown")
-                    caps = params.get("caps", [])
-                    commands = params.get("commands", [])
-                    platform = params.get("client", {}).get("platform", "unknown")
-                    version = params.get("client", {}).get("version", "unknown")
-
-                    from api_server.node_registry import NodeSession
-
-                    def send_fn(payload: Dict[str, Any]) -> None:
-                        asyncio.create_task(ws.send_str(json.dumps(payload)))
-
-                    node_session = NodeSession(
-                        node_id=node_id,
-                        send_fn=send_fn,
-                        caps=caps,
-                        commands=commands,
-                        platform=platform,
-                        version=version,
-                    )
-                    await NODE_REGISTRY.register(node_session)
-
-                    await ws.send_str(json.dumps({
-                        "type": "res",
-                        "id": data.get("id"),
-                        "ok": True,
-                        "payload": {
-                            "type": "hello-ok",
-                            "protocol": 1,
-                            "policy": {
-                                "maxPayload": 26214400,
-                                "tickIntervalMs": 15000,
-                            },
-                        },
-                    }))
-                    continue
-
-                # --- Invoke result from node ---
-                if msg_type == "event" and event == "node.invoke.result":
-                    payload = data.get("payload", {})
-                    request_id = payload.get("id")
-                    ok = payload.get("ok", False)
-                    result_payload = payload.get("payload")
-                    error = payload.get("error")
-                    NODE_REGISTRY.handle_result(request_id, ok, result_payload, error)
-                    continue
-
-        except Exception as exc:
-            logger.warning("[Node WS] Connection error for %s: %s", node_id, exc)
-        finally:
-            if node_id:
-                await NODE_REGISTRY.unregister(node_id)
-            if not ws.closed:
-                await ws.close()
-
-        return ws
+        from api_server.handlers.ws import handle_ws_real
+        return await handle_ws_real(request)
 
     # ------------------------------------------------------------------
     # Node HTTP API handlers
@@ -2279,27 +1256,10 @@ class StandaloneAPIServer:
 
     async def _handle_list_nodes(self, request: "web.Request") -> "web.Response":
         """GET /v1/nodes -- list all connected remote nodes."""
-        nodes = NODE_REGISTRY.list_nodes()
-        return web.json_response({"ok": True, "nodes": nodes})
+        from api_server.handlers.nodes import handle_list_nodes
+        return await handle_list_nodes(request, check_auth=self._check_auth)
 
     async def _handle_node_invoke(self, request: "web.Request") -> "web.Response":
         """POST /v1/nodes/{node_id}/invoke -- invoke a command on a remote node."""
-        node_id = request.match_info.get("node_id", "")
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"ok": False, "error": {"message": "Invalid JSON body"}}, status=400)
-
-        command = body.get("command", "")
-        params = body.get("params", {})
-        timeout_ms = body.get("timeoutMs", 30000)
-        idempotency_key = body.get("idempotencyKey")
-
-        result = await NODE_REGISTRY.invoke(
-            node_id=node_id,
-            command=command,
-            params=params,
-            timeout_ms=timeout_ms,
-            idempotency_key=idempotency_key,
-        )
-        return web.json_response(result)
+        from api_server.handlers.nodes import handle_node_invoke
+        return await handle_node_invoke(request, check_auth=self._check_auth)
