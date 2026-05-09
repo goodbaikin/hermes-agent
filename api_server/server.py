@@ -26,13 +26,10 @@ from api_server.sse import CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS
 from api_server.utils import is_network_accessible
 from api_server.utils import _make_request_fingerprint, _derive_chat_session_id, _normalize_chat_content, _normalize_multimodal_content, _content_has_visible_payload, _multimodal_validation_error
 
-from hermes_cli.config import load_config, save_config, get_hermes_home
-from hermes_cli.tools_config import _get_platform_tools
-from hermes_cli.auth import has_usable_secret
+from hermes_cli.config import get_hermes_home
 from hermes_cli.models import curated_models_for_provider, list_available_providers
 from hermes_state import SessionDB
 from tools.memory_tool import MemoryStore, get_memory_dir
-from tools.skills_tool import skills_list, skill_view
 
 logger = logging.getLogger(__name__)
 
@@ -1104,21 +1101,14 @@ class StandaloneAPIServer:
             "supports_responses_api": True,
             "supports_runs_api": True,
         })
-
     async def _handle_available_models(self, request: "web.Request") -> "web.Response":
         """GET /api/available-models -- list provider models and available providers."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        config = load_config()
-        current = self._current_model_settings(config)
-        provider = (request.query.get("provider") or current["provider"] or "openrouter").strip()
-        models = [
-            {"id": model_id, "description": description}
-            for model_id, description in curated_models_for_provider(provider)
-        ]
-        providers = list_available_providers()
-        return web.json_response({"provider": provider, "models": models, "providers": providers})
+        from api_server.handlers.config import handle_available_models
+        return await handle_available_models(
+            request,
+            check_auth=self._check_auth,
+            current_model_settings=self._current_model_settings,
+        )
 
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":

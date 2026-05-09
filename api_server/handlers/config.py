@@ -82,16 +82,20 @@ async def handle_update_config(request: web.Request, *, check_auth) -> web.Respo
     })
 
 
-async def handle_available_models(request: web.Request, *, check_auth) -> web.Response:
+from hermes_cli.models import curated_models_for_provider, list_available_providers
+
+
+async def handle_available_models(request: web.Request, *, check_auth, current_model_settings=None) -> web.Response:
     """GET /api/available-models -- list provider models and available providers."""
     auth_err = check_auth(request)
     if auth_err:
         return auth_err
     config = load_config()
-    current = _current_model_settings(config)
+    if current_model_settings:
+        current = current_model_settings(config)
+    else:
+        current = _current_model_settings(config)
     provider = (request.query.get("provider") or current["provider"] or "openrouter").strip()
-
-    from hermes_cli.providers import curated_models_for_provider, list_available_providers
     models = [
         {"id": model_id, "description": description}
         for model_id, description in curated_models_for_provider(provider)

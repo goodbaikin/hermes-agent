@@ -818,9 +818,9 @@ class TestAvailableModels:
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with (
-                patch("api_server.server.load_config", return_value=mock_config),
-                patch("api_server.server.curated_models_for_provider", return_value=mock_curated),
-                patch("api_server.server.list_available_providers", return_value=mock_providers),
+                patch("api_server.handlers.config.load_config", return_value=mock_config),
+                patch("api_server.handlers.config.curated_models_for_provider", return_value=mock_curated),
+                patch("api_server.handlers.config.list_available_providers", return_value=mock_providers),
             ):
                 resp = await cli.get("/api/available-models?provider=anthropic")
                 assert resp.status == 200
@@ -838,9 +838,9 @@ class TestAvailableModels:
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with (
-                patch("api_server.server.load_config", return_value=mock_config),
-                patch("api_server.server.curated_models_for_provider", return_value=[]) as mock_curated,
-                patch("api_server.server.list_available_providers", return_value=[]),
+                patch("api_server.handlers.config.load_config", return_value=mock_config),
+                patch("api_server.handlers.config.curated_models_for_provider", return_value=[]) as mock_curated,
+                patch("api_server.handlers.config.list_available_providers", return_value=[]),
             ):
                 resp = await cli.get("/api/available-models")
                 assert resp.status == 200
