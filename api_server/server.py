@@ -331,20 +331,6 @@ class StandaloneAPIServer:
         return self._memory_store
 
     @staticmethod
-    def _normalize_session_record(session: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Parse serialized session fields into API-friendly JSON."""
-        if session is None:
-            return None
-        normalized = dict(session)
-        model_config = normalized.get("model_config")
-        if model_config:
-            try:
-                normalized["model_config"] = json.loads(model_config)
-            except (TypeError, json.JSONDecodeError):
-                pass
-        return normalized
-
-    @staticmethod
     def _current_model_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         """Extract model/provider/base_url/api_mode from config.yaml."""
         model_cfg = config.get("model")
