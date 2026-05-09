@@ -120,12 +120,16 @@ class NodeRegistry:
 
         try:
             node.send({
-                "type": "invoke",
-                "reqId": req_id,
-                "command": command,
-                "params": params,
-                "timeoutMs": timeout_ms,
-                "idempotencyKey": idempotency_key,
+                "type": "event",
+                "event": "node.invoke.request",
+                "payload": {
+                    "id": req_id,
+                    "nodeId": node_id,
+                    "command": command,
+                    "paramsJSON": json.dumps(params) if params else None,
+                    "timeoutMs": timeout_ms,
+                    "idempotencyKey": idempotency_key,
+                },
             })
 
             await asyncio.wait_for(event.wait(), timeout=timeout_ms / 1000)

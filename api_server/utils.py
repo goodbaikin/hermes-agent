@@ -54,7 +54,7 @@ def is_network_accessible(host: str) -> bool:
             return True
         return False
     except Exception:
-        return False
+        return True
 
 
 def _openai_error(

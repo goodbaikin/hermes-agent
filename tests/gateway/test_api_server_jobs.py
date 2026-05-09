@@ -18,9 +18,10 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter, cors_middleware
+from api_server.server import StandaloneAPIServer
+from api_server.middleware import cors_middleware
 
-_MOD = "gateway.platforms.api_server"
+_MOD = "api_server.server"
 
 
 # ---------------------------------------------------------------------------
@@ -39,16 +40,16 @@ SAMPLE_JOB = {
 VALID_JOB_ID = "aabbccddeeff"
 
 
-def _make_adapter(api_key: str = "") -> APIServerAdapter:
+def _make_adapter(api_key: str = "") -> StandaloneAPIServer:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
         extra["key"] = api_key
     config = PlatformConfig(enabled=True, extra=extra)
-    return APIServerAdapter(config)
+    return StandaloneAPIServer(config)
 
 
-def _create_app(adapter: APIServerAdapter) -> web.Application:
+def _create_app(adapter: StandaloneAPIServer) -> web.Application:
     """Create the aiohttp app with jobs routes registered."""
     app = web.Application(middlewares=[cors_middleware])
     app["api_server_adapter"] = adapter

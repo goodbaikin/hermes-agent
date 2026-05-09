@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes Node Client (LXC 204)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/hermes_node_client.py --gateway ws://192.168.1.187:8642/ws --node-id lxc-204
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -19,11 +19,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import (
-    APIServerAdapter,
-    cors_middleware,
-    security_headers_middleware,
-)
+from api_server.server import StandaloneAPIServer
+from api_server.middleware import cors_middleware, security_headers_middleware
 
 
 # ---------------------------------------------------------------------------
@@ -31,17 +28,17 @@ from gateway.platforms.api_server import (
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "") -> APIServerAdapter:
+def _make_adapter(api_key: str = "") -> StandaloneAPIServer:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
         extra["key"] = api_key
     config = PlatformConfig(enabled=True, extra=extra)
-    adapter = APIServerAdapter(config)
+    adapter = StandaloneAPIServer(config)
     return adapter
 
 
-def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
+def _create_runs_app(adapter: StandaloneAPIServer) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)

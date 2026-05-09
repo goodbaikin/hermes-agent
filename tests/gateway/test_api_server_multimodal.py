@@ -14,13 +14,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import (
-    APIServerAdapter,
-    _content_has_visible_payload,
-    _normalize_multimodal_content,
-    cors_middleware,
-    security_headers_middleware,
-)
+from api_server.server import StandaloneAPIServer
+from api_server.middleware import cors_middleware, security_headers_middleware
+from api_server.utils import _content_has_visible_payload, _normalize_multimodal_content
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +118,12 @@ class TestContentHasVisiblePayload:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter() -> APIServerAdapter:
-    return APIServerAdapter(PlatformConfig(enabled=True))
+def _make_adapter() -> StandaloneAPIServer:
+    """Create an adapter with no API key for testing."""
+    return StandaloneAPIServer(PlatformConfig(enabled=True))
 
 
-def _create_app(adapter: APIServerAdapter) -> web.Application:
+def _create_app(adapter: StandaloneAPIServer) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter

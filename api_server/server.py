@@ -21,16 +21,18 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from api_server.node_registry import NODE_REGISTRY
 from gateway.platforms.base import SendResult
-from api_server.middleware import cors_middleware, body_limit_middleware, security_headers_middleware, _openai_error, MAX_REQUEST_BYTES, _CORS_HEADERS, _IdempotencyCache, _idem_cache
+from api_server.middleware import cors_middleware, body_limit_middleware, security_headers_middleware, _openai_error, MAX_REQUEST_BYTES, _CORS_HEADERS, _IdempotencyCache, _idem_cache, _CRON_AVAILABLE, _cron_list, _cron_get, _cron_create, _cron_update, _cron_remove, _cron_pause, _cron_resume, _cron_trigger
 from api_server.sse import CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS
 from api_server.utils import is_network_accessible
-from api_server.utils import _make_request_fingerprint, _derive_chat_session_id, _normalize_chat_content, _normalize_multimodal_content, _content_has_visible_payload
+from api_server.utils import _make_request_fingerprint, _derive_chat_session_id, _normalize_chat_content, _normalize_multimodal_content, _content_has_visible_payload, _multimodal_validation_error
 
-from hermes_cli.config import load_config, save_config
+from hermes_cli.config import load_config, save_config, get_hermes_home
 from hermes_cli.tools_config import _get_platform_tools
 from hermes_cli.auth import has_usable_secret
+from hermes_cli.models import curated_models_for_provider, list_available_providers
 from hermes_state import SessionDB
-from tools.memory_tool import MemoryStore
+from tools.memory_tool import MemoryStore, get_memory_dir
+from tools.skills_tool import skills_list, skill_view
 
 logger = logging.getLogger(__name__)
 
@@ -567,7 +569,9 @@ class StandaloneAPIServer:
             return web.json_response({"error": str(e)}, status=400)
 
         source = (request.query.get("source") or "").strip() or None
-        db = self._get_session_db()
+        db = self._ensure_session_db()
+        if not db:
+            return web.json_response({"items": [], "total": 0})
         items = [
             self._normalize_session_record(item)
             for item in db.list_sessions_rich(source=source, limit=limit, offset=offset)
@@ -1712,23 +1716,6 @@ class StandaloneAPIServer:
             "deleted": True,
         })
 
-    async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
-        """DELETE /v1/responses/{response_id} -- delete a stored response."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        response_id = request.match_info["response_id"]
-        deleted = self._response_store.delete(response_id)
-        if not deleted:
-            return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
-
-        return web.json_response({
-            "id": response_id,
-            "object": "response",
-            "deleted": True,
-        })
-
     # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
@@ -1956,229 +1943,31 @@ class StandaloneAPIServer:
     def _normalize_session_record(record: Dict[str, Any]) -> Dict[str, Any]:
         if record is None:
             return None
+        normalized = dict(record)
+        model_config = normalized.get("model_config")
+        if model_config:
+            try:
+                normalized["model_config"] = json.loads(model_config)
+            except (TypeError, json.JSONDecodeError):
+                pass
         return {
-            "id": record.get("id"),
-            "source": record.get("source"),
-            "user_id": record.get("user_id"),
-            "model": record.get("model"),
-            "title": record.get("title"),
-            "started_at": record.get("started_at"),
-            "ended_at": record.get("ended_at"),
-            "end_reason": record.get("end_reason"),
-            "message_count": record.get("message_count") or 0,
-            "tool_call_count": record.get("tool_call_count") or 0,
-            "input_tokens": record.get("input_tokens") or 0,
-            "output_tokens": record.get("output_tokens") or 0,
-            "last_active": record.get("last_active"),
-            "parent_session_id": record.get("parent_session_id"),
+            "id": normalized.get("id") or normalized.get("session_id"),
+            "session_id": normalized.get("session_id") or normalized.get("id"),
+            "source": normalized.get("source"),
+            "user_id": normalized.get("user_id"),
+            "model": normalized.get("model"),
+            "title": normalized.get("title"),
+            "started_at": normalized.get("started_at"),
+            "ended_at": normalized.get("ended_at"),
+            "end_reason": normalized.get("end_reason"),
+            "message_count": normalized.get("message_count") or 0,
+            "tool_call_count": normalized.get("tool_call_count") or 0,
+            "input_tokens": normalized.get("input_tokens") or 0,
+            "output_tokens": normalized.get("output_tokens") or 0,
+            "last_active": normalized.get("last_active"),
+            "parent_session_id": normalized.get("parent_session_id"),
+            "model_config": normalized.get("model_config"),
         }
-
-    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            db = self._ensure_session_db()
-            if not db:
-                return web.json_response({"items": [], "total": 0})
-            limit = max(1, min(500, int(request.query.get("limit", "50"))))
-            offset = max(0, int(request.query.get("offset", "0")))
-            items = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
-            return web.json_response({
-                "items": [self._normalize_session_record(item) for item in items],
-                "total": total,
-            })
-        except Exception as e:
-            logger.exception("Error listing sessions")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            db = self._ensure_session_db()
-            if not db:
-                return web.json_response({"error": "Session DB unavailable"}, status=503)
-            session_id = request.match_info.get("session_id", "")
-            resolved = db.resolve_session_id(session_id) or session_id
-            item = db.get_session(resolved)
-            if not item:
-                return web.json_response({"error": "Session not found"}, status=404)
-            return web.json_response({"session": self._normalize_session_record(item)})
-        except Exception as e:
-            logger.exception("Error getting session")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            body = await request.json() if request.can_read_body else {}
-            requested_id = str(body.get("id") or "").strip()
-            session_id = requested_id or str(uuid.uuid4())
-            title = str(body.get("title") or "").strip() or None
-            model = str(body.get("model") or "").strip() or None
-            db = self._ensure_session_db()
-            if not db:
-                return web.json_response({"error": "Session DB unavailable"}, status=503)
-            created_id = db.create_session(session_id=session_id, source="api_server", model=model)
-            if title:
-                try:
-                    db.set_session_title(created_id, title)
-                except Exception:
-                    pass
-            item = db.get_session(created_id) or {"id": created_id, "model": model, "title": title, "started_at": time.time()}
-            return web.json_response({"session": self._normalize_session_record(item)})
-        except Exception as e:
-            logger.exception("Error creating session")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_update_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            db = self._ensure_session_db()
-            if not db:
-                return web.json_response({"error": "Session DB unavailable"}, status=503)
-            session_id = request.match_info.get("session_id", "")
-            resolved = db.resolve_session_id(session_id) or session_id
-            body = await request.json() if request.can_read_body else {}
-            title = str(body.get("title") or "").strip()
-            if not title:
-                return web.json_response({"error": "title required"}, status=400)
-            ok = db.set_session_title(resolved, title)
-            if not ok:
-                return web.json_response({"error": "Session not found"}, status=404)
-            item = db.get_session(resolved)
-            return web.json_response({"session": self._normalize_session_record(item or {"id": resolved, "title": title})})
-        except Exception as e:
-            logger.exception("Error updating session")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            db = self._ensure_session_db()
-            if not db:
-                return web.json_response({"error": "Session DB unavailable"}, status=503)
-            session_id = request.match_info.get("session_id", "")
-            resolved = db.resolve_session_id(session_id) or session_id
-            ok = db.delete_session(resolved)
-            if not ok:
-                return web.json_response({"error": "Session not found"}, status=404)
-            return web.json_response({"ok": True, "session_id": resolved})
-        except Exception as e:
-            logger.exception("Error deleting session")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_get_session_messages(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            db = self._ensure_session_db()
-            if not db:
-                return web.json_response({"items": [], "total": 0})
-            session_id = request.match_info.get("session_id", "")
-            resolved = db.resolve_session_id(session_id) or session_id
-            items = db.get_messages(resolved)
-            return web.json_response({"items": items, "total": len(items)})
-        except Exception as e:
-            logger.exception("Error getting session messages")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            from tools.memory_tool import get_memory_dir
-            mem_dir = get_memory_dir()
-            result = {}
-            for name in ("MEMORY.md", "USER.md"):
-                path = mem_dir / name
-                if path.exists():
-                    result[name] = path.read_text(encoding="utf-8")
-            return web.json_response(result)
-        except Exception as e:
-            logger.exception("Error reading memory")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            import yaml
-            from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files
-
-            skills = []
-            for skills_dir in get_all_skills_dirs():
-                if not skills_dir.is_dir():
-                    continue
-                for skill_path in iter_skill_index_files(skills_dir, "SKILL.md"):
-                    try:
-                        raw = skill_path.read_text(encoding="utf-8")
-                        frontmatter = {}
-                        if raw.startswith("---"):
-                            parts = raw.split("---", 2)
-                            if len(parts) >= 3:
-                                frontmatter = yaml.safe_load(parts[1]) or {}
-                        skill_dir = skill_path.parent
-                        name = frontmatter.get("name") or skill_dir.name
-                        skills.append({
-                            "id": name,
-                            "name": name,
-                            "description": frontmatter.get("description", ""),
-                            "author": frontmatter.get("author", ""),
-                            "tags": frontmatter.get("tags", []),
-                            "triggers": frontmatter.get("triggers", []),
-                            "category": frontmatter.get("category", ""),
-                            "installed": True,
-                            "enabled": True,
-                            "sourcePath": str(skill_path),
-                            "content": raw,
-                        })
-                    except Exception as skill_err:
-                        logger.debug("Error reading skill %s: %s", skill_path, skill_err)
-            return web.json_response({"items": skills, "total": len(skills)})
-        except Exception as e:
-            logger.exception("Error listing skills")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def _handle_get_config(self, request: "web.Request") -> "web.Response":
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            import copy
-            import yaml
-
-            config_path = get_hermes_home() / "config.yaml"
-            if not config_path.exists():
-                return web.json_response({})
-            with open(config_path, encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
-            safe_keys = [
-                "model", "provider", "display", "memory", "timezone",
-                "skills", "toolsets", "agent", "tts", "stt",
-                "smart_model_routing", "custom_providers",
-            ]
-            safe_config = {k: copy.deepcopy(config[k]) for k in safe_keys if k in config}
-            if "custom_providers" in safe_config and isinstance(safe_config["custom_providers"], list):
-                for provider in safe_config["custom_providers"]:
-                    if isinstance(provider, dict):
-                        provider.pop("api_key", None)
-            return web.json_response(safe_config)
-        except Exception as e:
-            logger.exception("Error reading config")
-            return web.json_response({"error": str(e)}, status=500)
 
     # ------------------------------------------------------------------
     # Output extraction helper
