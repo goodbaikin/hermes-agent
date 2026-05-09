@@ -742,7 +742,7 @@ class TestGetConfig:
         }
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("api_server.server.load_config", return_value=mock_config):
+            with patch("api_server.handlers.config.load_config", return_value=mock_config):
                 resp = await cli.get("/api/config")
                 assert resp.status == 200
                 data = await resp.json()
@@ -760,8 +760,8 @@ class TestUpdateConfig:
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with (
-                patch("api_server.server.load_config", return_value=mock_config),
-                patch("api_server.server.save_config") as mock_save,
+                patch("api_server.handlers.config.load_config", return_value=mock_config),
+                patch("api_server.handlers.config.save_config") as mock_save,
             ):
                 resp = await cli.patch("/api/config", json={"model": "gpt-4o"})
                 assert resp.status == 200
@@ -777,8 +777,8 @@ class TestUpdateConfig:
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with (
-                patch("api_server.server.load_config", return_value=mock_config),
-                patch("api_server.server.save_config") as mock_save,
+                patch("api_server.handlers.config.load_config", return_value=mock_config),
+                patch("api_server.handlers.config.save_config") as mock_save,
             ):
                 resp = await cli.patch("/api/config", json={"provider": "anthropic"})
                 assert resp.status == 200
@@ -802,8 +802,8 @@ class TestUpdateConfig:
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with (
-                patch("api_server.server.load_config", return_value=mock_config),
-                patch("api_server.server.save_config", side_effect=IOError("Permission denied")),
+                patch("api_server.handlers.config.load_config", return_value=mock_config),
+                patch("api_server.handlers.config.save_config", side_effect=IOError("Permission denied")),
             ):
                 resp = await cli.patch("/api/config", json={"model": "gpt-4o"})
                 assert resp.status == 500

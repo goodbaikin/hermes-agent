@@ -1051,58 +1051,13 @@ class StandaloneAPIServer:
 
     async def _handle_get_config(self, request: "web.Request") -> "web.Response":
         """GET /api/config -- fetch the current config."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        config = load_config()
-        current = self._current_model_settings(config)
-        return web.json_response({
-            "model": current["model"],
-            "provider": current["provider"],
-            "api_mode": current["api_mode"],
-            "base_url": current["base_url"],
-            "config": config,
-        })
+        from api_server.handlers.config import handle_get_config
+        return await handle_get_config(request, check_auth=self._check_auth)
 
     async def _handle_update_config(self, request: "web.Request") -> "web.Response":
         """PATCH /api/config -- update model/provider/base_url settings."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "Invalid JSON in request body"}, status=400)
-
-        config = load_config()
-        model_cfg = config.get("model")
-        if isinstance(model_cfg, dict):
-            updated_model_cfg = dict(model_cfg)
-        elif isinstance(model_cfg, str) and model_cfg.strip():
-            updated_model_cfg = {"default": model_cfg.strip()}
-        else:
-            updated_model_cfg = {}
-
-        if "model" in body:
-            updated_model_cfg["default"] = str(body.get("model") or "").strip()
-        if "provider" in body:
-            updated_model_cfg["provider"] = str(body.get("provider") or "").strip()
-        if "base_url" in body:
-            updated_model_cfg["base_url"] = str(body.get("base_url") or "").strip()
-
-        config["model"] = updated_model_cfg
-        try:
-            save_config(config)
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
-
-        current = self._current_model_settings(config)
-        return web.json_response({
-            "ok": True,
-            "model": current["model"],
-            "provider": current["provider"],
-            "base_url": current["base_url"],
-        })
+        from api_server.handlers.config import handle_update_config
+        return await handle_update_config(request, check_auth=self._check_auth)
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities -- list available toolsets and reasoning modes."""
