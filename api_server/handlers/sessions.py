@@ -10,21 +10,31 @@ logger = logging.getLogger(__name__)
 def _normalize_session_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if record is None:
         return None
+    normalized = dict(record)
+    model_config = normalized.get("model_config")
+    if model_config:
+        try:
+            import json
+            normalized["model_config"] = json.loads(model_config)
+        except (TypeError, json.JSONDecodeError):
+            pass
     return {
-        "id": record.get("id"),
-        "source": record.get("source"),
-        "user_id": record.get("user_id"),
-        "model": record.get("model"),
-        "title": record.get("title"),
-        "started_at": record.get("started_at"),
-        "ended_at": record.get("ended_at"),
-        "end_reason": record.get("end_reason"),
-        "message_count": record.get("message_count") or 0,
-        "tool_call_count": record.get("tool_call_count") or 0,
-        "input_tokens": record.get("input_tokens") or 0,
-        "output_tokens": record.get("output_tokens") or 0,
-        "last_active": record.get("last_active"),
-        "parent_session_id": record.get("parent_session_id"),
+        "id": normalized.get("id") or normalized.get("session_id"),
+        "session_id": normalized.get("session_id") or normalized.get("id"),
+        "source": normalized.get("source"),
+        "user_id": normalized.get("user_id"),
+        "model": normalized.get("model"),
+        "title": normalized.get("title"),
+        "started_at": normalized.get("started_at"),
+        "ended_at": normalized.get("ended_at"),
+        "end_reason": normalized.get("end_reason"),
+        "message_count": normalized.get("message_count") or 0,
+        "tool_call_count": normalized.get("tool_call_count") or 0,
+        "input_tokens": normalized.get("input_tokens") or 0,
+        "output_tokens": normalized.get("output_tokens") or 0,
+        "last_active": normalized.get("last_active"),
+        "parent_session_id": normalized.get("parent_session_id"),
+        "model_config": normalized.get("model_config"),
     }
 
 
@@ -36,14 +46,18 @@ async def handle_list_sessions(request: web.Request, *, check_auth, ensure_sessi
         db = ensure_session_db()
         if not db:
             return web.json_response({"items": [], "total": 0})
-        limit = max(1, min(500, int(request.query.get("limit", "50"))))
-        offset = max(0, int(request.query.get("offset", "0")))
-        items = db.list_sessions_rich(limit=limit, offset=offset)
-        total = db.session_count()
+        from api_server.utils import _parse_int
+        limit = _parse_int(request.query.get("limit"), 50)
+        offset = _parse_int(request.query.get("offset"), 0)
+        source = (request.query.get("source") or "").strip() or None
+        items = db.list_sessions_rich(source=source, limit=limit, offset=offset)
+        total = db.session_count(source=source)
         return web.json_response({
             "items": [_normalize_session_record(item) for item in items],
             "total": total,
         })
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     except Exception as e:
         logger.exception("Error listing sessions")
         return web.json_response({"error": str(e)}, status=500)
@@ -74,6 +88,9 @@ async def handle_create_session(request: web.Request, *, check_auth, ensure_sess
         return auth_err
     try:
         body = await request.json() if request.can_read_body else {}
+    except (json.JSONDecodeError, Exception):
+        return web.json_response({"error": "Invalid JSON in request body"}, status=400)
+    try:
         requested_id = str(body.get("id") or "").strip()
         session_id = requested_id or str(uuid.uuid4())
         title = str(body.get("title") or "").strip() or None
@@ -147,6 +164,8 @@ async def handle_get_session_messages(request: web.Request, *, check_auth, ensur
             return web.json_response({"items": [], "total": 0})
         session_id = request.match_info.get("session_id", "")
         resolved = db.resolve_session_id(session_id) or session_id
+        if db.get_session(resolved) is None:
+            db.ensure_session(resolved, source="web")
         items = db.get_messages(resolved)
         return web.json_response({"items": items, "total": len(items)})
     except Exception as e:

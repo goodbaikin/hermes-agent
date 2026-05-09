@@ -22,6 +22,16 @@ _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 
 
+def _parse_int(value: Any, default: int, minimum: int = 0) -> int:
+    """Parse an integer query parameter with bounds."""
+    if value in (None, ""):
+        return default
+    parsed = int(value)
+    if parsed < minimum:
+        raise ValueError(f"Value must be >= {minimum}")
+    return parsed
+
+
 def is_network_accessible(host: str) -> bool:
     """Return True if *host* would expose the server beyond loopback.
 

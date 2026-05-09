@@ -559,25 +559,12 @@ class StandaloneAPIServer:
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions -- list sessions."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        try:
-            limit = self._parse_int(request.query.get("limit"), 50)
-            offset = self._parse_int(request.query.get("offset"), 0)
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-
-        source = (request.query.get("source") or "").strip() or None
-        db = self._ensure_session_db()
-        if not db:
-            return web.json_response({"items": [], "total": 0})
-        items = [
-            self._normalize_session_record(item)
-            for item in db.list_sessions_rich(source=source, limit=limit, offset=offset)
-        ]
-        total = db.session_count(source=source)
-        return web.json_response({"items": items, "total": total})
+        from api_server.handlers.sessions import handle_list_sessions
+        return await handle_list_sessions(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions -- create a new session."""
@@ -632,26 +619,21 @@ class StandaloneAPIServer:
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id} -- fetch one session."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        session = self._normalize_session_record(self._get_session_db().get_session(session_id))
-        if session is None:
-            return web.json_response({"error": "Session not found"}, status=404)
-        return web.json_response({"session": session})
+        from api_server.handlers.sessions import handle_get_session
+        return await handle_get_session(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_get_session_messages(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}/messages -- fetch session messages."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        session_id = request.match_info["session_id"]
-        db = self._get_session_db()
-        if db.get_session(session_id) is None:
-            db.ensure_session(session_id, source="web")
-        items = db.get_messages(session_id)
-        return web.json_response({"items": items, "total": len(items)})
+        from api_server.handlers.sessions import handle_get_session_messages
+        return await handle_get_session_messages(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
 
     async def _handle_update_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} -- update a session."""
