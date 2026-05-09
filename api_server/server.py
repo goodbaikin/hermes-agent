@@ -1041,20 +1041,13 @@ class StandaloneAPIServer:
 
     async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
         """GET /api/skills -- list skills."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        category = (request.query.get("category") or "").strip() or None
-        return web.json_response(json.loads(skills_list(category=category)))
+        from api_server.handlers.skills import handle_list_skills
+        return await handle_list_skills(request, check_auth=self._check_auth)
 
     async def _handle_view_skill(self, request: "web.Request") -> "web.Response":
         """GET /api/skills/{name} -- fetch skill details."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        name = request.match_info["name"]
-        file_path = (request.query.get("file_path") or "").strip() or None
-        return web.json_response(json.loads(skill_view(name, file_path=file_path)))
+        from api_server.handlers.skills import handle_view_skill
+        return await handle_view_skill(request, check_auth=self._check_auth)
 
     async def _handle_get_config(self, request: "web.Request") -> "web.Response":
         """GET /api/config -- fetch the current config."""

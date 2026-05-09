@@ -669,7 +669,7 @@ class TestListSkills:
         mock_result = json.dumps({"skills": [{"name": "git", "description": "Git commands"}]})
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("api_server.server.skills_list", return_value=mock_result):
+            with patch("api_server.handlers.skills.skills_list", return_value=mock_result):
                 resp = await cli.get("/api/skills")
                 assert resp.status == 200
                 data = await resp.json()
@@ -680,7 +680,7 @@ class TestListSkills:
         mock_result = json.dumps({"skills": []})
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("api_server.server.skills_list", return_value=mock_result) as mock_fn:
+            with patch("api_server.handlers.skills.skills_list", return_value=mock_result) as mock_fn:
                 resp = await cli.get("/api/skills?category=development")
                 assert resp.status == 200
                 mock_fn.assert_called_once_with(category="development")
@@ -711,7 +711,7 @@ class TestViewSkill:
         })
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("api_server.server.skill_view", return_value=mock_result) as mock_fn:
+            with patch("api_server.handlers.skills.skill_view", return_value=mock_result) as mock_fn:
                 resp = await cli.get("/api/skills/git")
                 assert resp.status == 200
                 data = await resp.json()
@@ -723,7 +723,7 @@ class TestViewSkill:
         mock_result = json.dumps({"name": "git", "content": "# Git"})
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("api_server.server.skill_view", return_value=mock_result) as mock_fn:
+            with patch("api_server.handlers.skills.skill_view", return_value=mock_result) as mock_fn:
                 resp = await cli.get("/api/skills/git?file_path=README.md")
                 assert resp.status == 200
                 mock_fn.assert_called_once_with("git", file_path="README.md")

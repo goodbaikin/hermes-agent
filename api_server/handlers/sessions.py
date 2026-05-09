@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import uuid
@@ -106,6 +107,8 @@ async def handle_create_session(request: web.Request, *, check_auth, ensure_sess
                 pass
         item = db.get_session(created_id) or {"id": created_id, "model": model, "title": title, "started_at": time.time()}
         return web.json_response({"session": _normalize_session_record(item)})
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     except Exception as e:
         logger.exception("Error creating session")
         return web.json_response({"error": str(e)}, status=500)
