@@ -509,6 +509,24 @@ class StandaloneAPIServer:
             ensure_session_db=self._ensure_session_db,
         )
 
+    async def _handle_session_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/status -- session state for cross-device sync."""
+        from api_server.handlers.sessions import handle_session_status
+        return await handle_session_status(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
+
+    async def _handle_session_messages_diff(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/messages/diff -- differential message sync."""
+        from api_server.handlers.sessions import handle_session_messages_diff
+        return await handle_session_messages_diff(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
+
     async def _handle_update_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} -- update a session."""
         from api_server.handlers.sessions import handle_update_session
@@ -1109,6 +1127,8 @@ class StandaloneAPIServer:
             self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_get_session_messages)
+            self._app.router.add_get("/api/sessions/{session_id}/status", self._handle_session_status)
+            self._app.router.add_get("/api/sessions/{session_id}/messages/diff", self._handle_session_messages_diff)
             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_update_session)
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)

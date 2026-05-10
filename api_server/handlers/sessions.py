@@ -251,3 +251,85 @@ async def handle_search_sessions(request: web.Request, *, check_auth, ensure_ses
     except Exception as e:
         logger.exception("Error searching sessions")
         return web.json_response({"error": str(e)}, status=500)
+
+
+# ============================================================================
+# Discord Alternative — Phase 2: Session Status & Message Diff Sync
+# ============================================================================
+
+async def handle_session_status(request: web.Request, *, check_auth, ensure_session_db) -> web.Response:
+    """GET /api/sessions/{session_id}/status — observe session state for cross-device sync.
+
+    Returns: last_message_at, message_count, is_streaming, last_message_id
+    """
+    auth_err = check_auth(request)
+    if auth_err:
+        return auth_err
+    try:
+        db = ensure_session_db()
+        if not db:
+            return web.json_response({"error": "Session DB unavailable"}, status=503)
+        session_id = request.match_info.get("session_id", "")
+        resolved = db.resolve_session_id(session_id) or session_id
+        session = db.get_session(resolved)
+        if not session:
+            return web.json_response({"error": "Session not found"}, status=404)
+
+        messages = db.get_messages(resolved)
+        last_message = messages[-1] if messages else None
+        last_message_id = last_message.get("id") if last_message else None
+        last_message_at = last_message.get("created_at") if last_message else None
+
+        return web.json_response({
+            "session_id": resolved,
+            "last_message_at": last_message_at,
+            "message_count": len(messages),
+            "last_message_id": last_message_id,
+            "last_message_role": last_message.get("role") if last_message else None,
+        })
+    except Exception as e:
+        logger.exception("Error getting session status")
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_session_messages_diff(request: web.Request, *, check_auth, ensure_session_db) -> web.Response:
+    """GET /api/sessions/{session_id}/messages?since=message_id — differential sync.
+
+    Returns only messages after the given message_id (exclusive).
+    If since is not provided, returns all messages (fallback).
+    """
+    auth_err = check_auth(request)
+    if auth_err:
+        return auth_err
+    try:
+        db = ensure_session_db()
+        if not db:
+            return web.json_response({"items": [], "total": 0})
+        session_id = request.match_info.get("session_id", "")
+        resolved = db.resolve_session_id(session_id) or session_id
+        if db.get_session(resolved) is None:
+            db.ensure_session(resolved, source="web")
+
+        since_id = (request.query.get("since") or "").strip()
+        items = db.get_messages(resolved)
+
+        if since_id:
+            # Find index of since_id, return messages after it
+            found_idx = -1
+            for i, msg in enumerate(items):
+                if str(msg.get("id", "")) == since_id:
+                    found_idx = i
+                    break
+            if found_idx >= 0:
+                items = items[found_idx + 1:]
+            # If not found, return all (client may have stale since_id)
+
+        return web.json_response({
+            "items": items,
+            "total": len(items),
+            "since": since_id or None,
+            "session_id": resolved,
+        })
+    except Exception as e:
+        logger.exception("Error getting session messages diff")
+        return web.json_response({"error": str(e)}, status=500)
