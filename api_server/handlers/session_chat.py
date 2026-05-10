@@ -193,19 +193,31 @@ async def handle_session_chat_stream(
                 {"session_id": session_id, "run_id": run_id, "message_id": assistant_message_id, "delta": delta},
             )
 
-    def _on_tool_progress(event_type, name, preview, args):
+    def _on_tool_start(tool_call_id, function_name, function_args):
+        _queue_event("tool.started", {
+            "session_id": session_id,
+            "run_id": run_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": function_name,
+            "args": function_args,
+        })
+
+    def _on_tool_progress(event_type, name, preview, args, **kwargs):
         if name == "_thinking":
             _queue_event(
                 "tool.progress",
                 {"session_id": session_id, "run_id": run_id, "message_id": assistant_message_id, "delta": preview},
             )
             return
+        tool_call_id = kwargs.get("tool_call_id", "")
+        logger.info(f"[_on_tool_progress] tool.started name={name} tool_call_id={tool_call_id}")
         payload = {
             "session_id": session_id,
             "run_id": run_id,
             "tool_name": name,
             "preview": preview,
             "args": args,
+            "tool_call_id": tool_call_id,
         }
         _queue_event("tool.started", payload)
         # Also send tool.progress for progress updates
@@ -214,6 +226,35 @@ async def handle_session_chat_stream(
     agent_ref = [None]
     loop = asyncio.get_event_loop()
 
+    def _make_tool_complete_callback(run_id, loop):
+        """Return a tool_complete_callback that pushes tool.completed events to the SSE queue."""
+        def _callback(tool_call_id, tool_name, args, function_result):
+            logger.info(f"[TOOL COMPLETE CALLBACK] tool_call_id={tool_call_id} tool_name={tool_name}")
+            try:
+                result_preview = ""
+                is_error = False
+                if isinstance(function_result, dict):
+                    result_preview = function_result.get("preview", "") or function_result.get("output_preview", "")
+                    is_error = function_result.get("is_error", False) or function_result.get("error", False)
+                elif isinstance(function_result, str):
+                    result_preview = function_result[:200]
+                loop.call_soon_threadsafe(
+                    _queue_event,
+                    "tool.completed",
+                    {
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "tool": tool_name,
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "result_preview": result_preview,
+                        "is_error": is_error,
+                    }
+                )
+            except Exception:
+                pass
+        return _callback
+
     async def _run_agent_task():
         def _run():
             agent = create_agent(
@@ -221,6 +262,8 @@ async def handle_session_chat_stream(
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                tool_start_callback=_on_tool_start,
+                tool_complete_callback=_make_tool_complete_callback(run_id, loop),
             )
             agent._session_db = db  # Enable session persistence
             agent_ref[0] = agent

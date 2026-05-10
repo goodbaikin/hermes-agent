@@ -9871,7 +9871,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback("tool.started", name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args, tool_call_id=tc.id)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -10085,7 +10085,7 @@ class AIAgent:
                     try:
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
-                            duration=tool_duration, is_error=is_error,
+                            duration=tool_duration, is_error=is_error, tool_call_id=tc.id,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -10110,6 +10110,7 @@ class AIAgent:
             self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
 
             if not blocked and self.tool_complete_callback:
+                logging.info(f"[RUN_AGENT] Calling tool_complete_callback for {name}, tc.id={tc.id}")
                 try:
                     self.tool_complete_callback(tc.id, name, args, function_result)
                 except Exception as cb_err:
@@ -10238,7 +10239,7 @@ class AIAgent:
             if not _execution_blocked and self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
-                    self.tool_progress_callback("tool.started", function_name, preview, function_args)
+                    self.tool_progress_callback("tool.started", function_name, preview, function_args, tool_call_id=tool_call.id)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 

@@ -1005,7 +1005,10 @@ class StandaloneAPIServer:
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
+                    "tool_name": tool_name,
+                    "tool_call_id": kwargs.get("tool_call_id", ""),
                     "preview": preview,
+                    "args": args,
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -1013,8 +1016,11 @@ class StandaloneAPIServer:
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
+                    "tool_name": tool_name,
+                    "tool_call_id": kwargs.get("tool_call_id", ""),
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    "result_preview": kwargs.get("result_preview", ""),
                 })
             elif event_type == "reasoning.available":
                 _push({

@@ -104,6 +104,31 @@ async def handle_runs(
 
     event_cb = adapter._make_run_event_callback(run_id, loop)
 
+    def _make_tool_complete_callback(run_id, loop):
+        """Return a tool_complete_callback that pushes tool.completed events to the run's SSE queue."""
+        def _callback(tool_call_id, tool_name, args, function_result):
+            try:
+                result_preview = ""
+                is_error = False
+                if isinstance(function_result, dict):
+                    result_preview = function_result.get("preview", "") or function_result.get("output_preview", "")
+                    is_error = function_result.get("is_error", False) or function_result.get("error", False)
+                elif isinstance(function_result, str):
+                    result_preview = function_result[:200]
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "tool.completed",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "tool": tool_name,
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "result_preview": result_preview,
+                    "is_error": is_error,
+                })
+            except Exception:
+                pass
+        return _callback
+
     # Also wire stream_delta_callback so message.delta events flow through.
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None:
@@ -135,6 +160,7 @@ async def handle_runs(
                 session_id=session_id,
                 stream_delta_callback=_text_cb,
                 tool_progress_callback=event_cb,
+                tool_complete_callback=_make_tool_complete_callback(run_id, loop),
             )
             adapter._active_run_agents[run_id] = agent
             def _run_sync():
