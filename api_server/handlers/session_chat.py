@@ -345,6 +345,29 @@ async def handle_session_chat_stream(
             result = await agent_task
         except Exception:
             result = {"messages": [], "final_response": "", "completed": False}
+
+        # Auto-generate session title after first exchange (synchronous — HTTP request/response)
+        try:
+            from agent.title_generator import auto_title_session
+            conversation_history = (history or []) + (result.get("messages") or [])
+            user_msg = ""
+            assistant_response = result.get("final_response") or ""
+            for m in conversation_history:
+                if m.get("role") == "user" and not user_msg:
+                    user_msg = m.get("content", "")
+                    if isinstance(user_msg, list):
+                        text_parts = [p.get("text", "") for p in user_msg if isinstance(p, dict) and p.get("type") == "text"]
+                        user_msg = " ".join(text_parts)
+                    user_msg = str(user_msg).strip()
+            auto_title_session(
+                session_db=db,
+                session_id=session_id,
+                user_message=user_msg,
+                assistant_response=assistant_response,
+            )
+        except Exception:
+            logger.debug("Auto-title failed for session %s", session_id, exc_info=True)
+
         tools = _tool_map(result.get("messages") or [])
         for item in result.get("messages") or []:
             if item.get("role") != "tool":
