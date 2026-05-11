@@ -25,6 +25,7 @@ _project_root = Path(__file__).parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
+from hermes_logging import setup_logging
 from api_server.server import StandaloneAPIServer, check_api_server_requirements
 
 logger = logging.getLogger(__name__)
@@ -40,9 +41,10 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    # Use Hermes logging setup with api_server mode (creates api_server.log)
+    setup_logging(
+        log_level="DEBUG" if args.verbose else "INFO",
+        mode="api_server",
     )
 
     if not check_api_server_requirements():

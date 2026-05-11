@@ -146,6 +146,7 @@ COMPONENT_PREFIXES = {
     "tools": ("tools",),
     "cli": ("hermes_cli", "cli"),
     "cron": ("cron",),
+    "api_server": ("api_server",),
 }
 
 
@@ -242,6 +243,18 @@ def setup_logging(
             backup_count=3,
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
+        )
+
+    # --- api_server.log (INFO+, api_server component only) ------------------
+    if mode == "api_server":
+        _add_rotating_handler(
+            root,
+            log_dir / "api_server.log",
+            level=logging.INFO,
+            max_bytes=5 * 1024 * 1024,
+            backup_count=3,
+            formatter=RedactingFormatter(_LOG_FORMAT),
+            log_filter=_ComponentFilter(COMPONENT_PREFIXES["api_server"] + ("aiohttp.access",)),
         )
 
     if _logging_initialized and not force:

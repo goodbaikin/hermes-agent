@@ -31,6 +31,7 @@ LOG_FILES = {
     "agent": "agent.log",
     "errors": "errors.log",
     "gateway": "gateway.log",
+    "api_server": "api_server.log",
 }
 
 # Log line timestamp regex — matches "2026-04-05 22:35:00,123" or
@@ -111,6 +112,7 @@ def _matches_filters(
     session_filter: Optional[str] = None,
     since: Optional[datetime] = None,
     component_prefixes: Optional[Sequence[str]] = None,
+    exclude_prefixes: Optional[Sequence[str]] = None,
 ) -> bool:
     """Check if a log line passes all active filters."""
     if since is not None:
@@ -132,6 +134,11 @@ def _matches_filters(
         if not _line_matches_component(line, component_prefixes):
             return False
 
+    if exclude_prefixes is not None:
+        name = _extract_logger_name(line)
+        if name is not None and name.startswith(tuple(exclude_prefixes)):
+            return False
+
     return True
 
 
@@ -150,7 +157,7 @@ def tail_log(
     Parameters
     ----------
     log_name
-        Which log to read: ``"agent"``, ``"errors"``, ``"gateway"``.
+        Which log to read: ``"agent"``, ``"errors"``, ``"gateway"``, ``"api_server"``.
     num_lines
         Number of recent lines to show (before follow starts).
     follow
@@ -206,11 +213,17 @@ def tail_log(
         or component_prefixes is not None
     )
 
+    # Exclude api_server and aiohttp.access lines from agent.log (they have their own log file)
+    exclude_prefixes = None
+    if log_name == "agent":
+        exclude_prefixes = ("api_server.", "aiohttp.access")
+
     # Read and display the tail
     try:
         lines = _read_tail(log_path, num_lines, has_filters=has_filters,
                            min_level=min_level, session_filter=session,
-                           since=since_dt, component_prefixes=component_prefixes)
+                           since=since_dt, component_prefixes=component_prefixes,
+                           exclude_prefixes=exclude_prefixes)
     except PermissionError:
         print(f"Permission denied: {log_path}")
         sys.exit(1)
@@ -241,7 +254,8 @@ def tail_log(
     # Follow mode — poll for new content
     try:
         _follow_log(log_path, min_level=min_level, session_filter=session,
-                     since=since_dt, component_prefixes=component_prefixes)
+                     since=since_dt, component_prefixes=component_prefixes,
+                     exclude_prefixes=exclude_prefixes)
     except KeyboardInterrupt:
         print("\n--- stopped ---")
 
@@ -255,12 +269,13 @@ def _read_tail(
     session_filter: Optional[str] = None,
     since: Optional[datetime] = None,
     component_prefixes: Optional[Sequence[str]] = None,
+    exclude_prefixes: Optional[Sequence[str]] = None,
 ) -> list:
     """Read the last *num_lines* matching lines from a log file.
 
     When filters are active, we read more raw lines to find enough matches.
     """
-    if has_filters:
+    if has_filters or exclude_prefixes is not None:
         # Read more lines to ensure we get enough after filtering.
         # For large files, read last 10K lines and filter down.
         raw_lines = _read_last_n_lines(path, max(num_lines * 20, 2000))
@@ -268,7 +283,8 @@ def _read_tail(
             l for l in raw_lines
             if _matches_filters(l, min_level=min_level,
                                 session_filter=session_filter, since=since,
-                                component_prefixes=component_prefixes)
+                                component_prefixes=component_prefixes,
+                                exclude_prefixes=exclude_prefixes)
         ]
         return filtered[-num_lines:]
     else:
@@ -338,6 +354,7 @@ def _follow_log(
     session_filter: Optional[str] = None,
     since: Optional[datetime] = None,
     component_prefixes: Optional[Sequence[str]] = None,
+    exclude_prefixes: Optional[Sequence[str]] = None,
 ) -> None:
     """Poll a log file for new content and print matching lines."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -348,7 +365,8 @@ def _follow_log(
             if line:
                 if _matches_filters(line, min_level=min_level,
                                     session_filter=session_filter, since=since,
-                                    component_prefixes=component_prefixes):
+                                    component_prefixes=component_prefixes,
+                                    exclude_prefixes=exclude_prefixes):
                     print(line, end="")
                     sys.stdout.flush()
             else:
