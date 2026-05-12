@@ -7010,6 +7010,20 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
+            # Also update current_prompt_tokens in SQLite DB for WebUI status bar
+            try:
+                from hermes_state import SessionDB
+                _db = SessionDB()
+                try:
+                    _db.update_current_prompt_tokens(
+                        session_entry.session_id,
+                        agent_result.get("last_prompt_tokens", 0) or 0,
+                    )
+                finally:
+                    _db.close()
+            except Exception:
+                pass
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
