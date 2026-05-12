@@ -187,8 +187,9 @@ async def handle_get_session_messages(request: web.Request, *, check_auth, ensur
         from api_server.utils import _parse_int
         limit = _parse_int(request.query.get("limit"), None)
         offset = _parse_int(request.query.get("offset"), 0)
+        order = request.query.get("order", "asc")  # "asc" | "desc"
         t_db = time.time()
-        items = db.get_messages(resolved, limit=limit, offset=offset)
+        items = db.get_messages(resolved, limit=limit, offset=offset, order=order)
         t_items = time.time()
         # Get total count for pagination info
         total = db.message_count(resolved) if hasattr(db, 'message_count') else len(items)

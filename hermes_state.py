@@ -1453,18 +1453,19 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def get_messages(self, session_id: str, limit: int = None, offset: int = 0) -> List[Dict[str, Any]]:
+    def get_messages(self, session_id: str, limit: int = None, offset: int = 0, order: str = "asc") -> List[Dict[str, Any]]:
         """Load messages for a session, ordered by timestamp."""
         # Read-only: no need for write lock
+        order_clause = "ORDER BY timestamp DESC, id DESC" if order == "desc" else "ORDER BY timestamp, id"
         try:
             if limit is not None:
                 cursor = self._conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id LIMIT ? OFFSET ?",
+                    f"SELECT * FROM messages WHERE session_id = ? {order_clause} LIMIT ? OFFSET ?",
                     (session_id, limit, offset),
                 )
             else:
                 cursor = self._conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+                    f"SELECT * FROM messages WHERE session_id = ? {order_clause}",
                     (session_id,),
                 )
             rows = cursor.fetchall()
@@ -1474,12 +1475,12 @@ class SessionDB:
                 time.sleep(0.05)
                 if limit is not None:
                     cursor = self._conn.execute(
-                        "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id LIMIT ? OFFSET ?",
+                        f"SELECT * FROM messages WHERE session_id = ? {order_clause} LIMIT ? OFFSET ?",
                         (session_id, limit, offset),
                     )
                 else:
                     cursor = self._conn.execute(
-                        "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+                        f"SELECT * FROM messages WHERE session_id = ? {order_clause}",
                         (session_id,),
                     )
                 rows = cursor.fetchall()
