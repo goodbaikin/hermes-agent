@@ -82,7 +82,7 @@ MAX_TIMEOUT_SEC = 600
 # ---------------------------------------------------------------------------
 
 async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
-    """Execute PowerShell/cmd locally. No SSH escaping hell."""
+    """Execute PowerShell locally. No SSH escaping hell."""
     cmd = params["cmd"]
     cwd = params.get("cwd")
     timeout_sec = min(
@@ -92,8 +92,27 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
 
-    proc = await asyncio.create_subprocess_shell(
-        cmd,
+    # On Windows: use PowerShell with UTF-8 encoding, bypassing cmd.exe AutoRun
+    if sys.platform == "win32":
+        # Build PowerShell command as argument list to avoid shell escaping issues
+        # Use -EncodedCommand for complex commands to avoid quoting hell
+        import base64
+        ps_script = (
+            '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
+            '$OutputEncoding = [System.Text.Encoding]::UTF8; '
+            f'{cmd}'
+        )
+        encoded = base64.b64encode(ps_script.encode('utf-16le')).decode()
+        args = [
+            "powershell", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+            "-EncodedCommand", encoded,
+        ]
+    else:
+        args = ["bash", "-c", cmd]
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -112,7 +131,7 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "stdout": stdout.decode("utf-8", errors="replace"),
-        "stderr": stderr.decode("utf-8", errors="replace"),
+        "stderr": stderr.decode("utf-8", errors="replace").replace("#< CLIXML", "").strip(),
         "exitCode": proc.returncode,
     }
 

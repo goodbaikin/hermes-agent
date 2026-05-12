@@ -745,6 +745,33 @@ def handle_function_call(
             except Exception:
                 pass  # file_tools may not be loaded yet
 
+        # Workspace routing: in "replace" mode, redirect local tool calls
+        # to remote nodes based on workspace configuration.
+        try:
+            from agent.workspace_router import route_tool_call
+            routed_result = route_tool_call(function_name, function_args, task_id=task_id, user_task=user_task)
+            if routed_result is not None:
+                # Tool was routed to a remote node — return result directly
+                # Still fire post_tool_call hooks for observability
+                try:
+                    from hermes_cli.plugins import invoke_hook
+                    invoke_hook(
+                        "post_tool_call",
+                        tool_name=function_name,
+                        args=function_args,
+                        result=routed_result,
+                        task_id=task_id or "",
+                        session_id=session_id or "",
+                        tool_call_id=tool_call_id or "",
+                        duration_ms=0,
+                    )
+                except Exception:
+                    pass
+                return routed_result
+        except Exception:
+            # Workspace routing is best-effort; fall through to normal dispatch
+            pass
+
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
         # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to

@@ -86,6 +86,10 @@ def node_patch(node_id: str, path: str, changes: List[Dict[str, Any]]) -> Dict[s
 
 def node_exec(node_id: str, cmd: str, timeout: int = 30) -> Dict[str, Any]:
     """Execute a command on a node."""
+    # On Windows nodes, prefix with UTF-8 encoding setup
+    # Detect if this is likely a Windows node by checking the command
+    # (node_invoke goes to the node client which runs on the target OS)
+    
     result_str = node_invoke(node_id, "terminal.exec", {
         "cmd": cmd,
         "timeout": timeout,
@@ -130,15 +134,17 @@ def node_search(node_id: str, pattern: str, path: str = ".", file_glob: str = No
     is_windows = "Linux" not in output and "Darwin" not in output
     
     if is_windows:
-        # Windows: use PowerShell Select-String or findstr
+        # Windows: use PowerShell with UTF-8 output encoding
+        # chcp 65001 sets UTF-8, [Console]::OutputEncoding ensures PowerShell uses it
+        ps_prefix = 'powershell -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
         if target == "files":
             # Find files by name
             glob_filter = f"-Filter '{file_glob}'" if file_glob else ""
-            cmd = f'powershell -Command "Get-ChildItem -Path \'{path}\' {glob_filter} -Recurse -Name"'
+            cmd = f'{ps_prefix}Get-ChildItem -Path \'{path}\' {glob_filter} -Recurse -Name"'
         else:
             # Search content
             include_opt = f"-Include '{file_glob}'" if file_glob else ""
-            cmd = f'powershell -Command "Get-ChildItem -Path \'{path}\' {include_opt} -Recurse | Select-String -Pattern \'{pattern}\' | Select-Object -First {limit} | ForEach-Object {{ \"$($_.Filename):$($_.LineNumber):$($_.Line)\" }}"'
+            cmd = f'{ps_prefix}Get-ChildItem -Path \'{path}\' {include_opt} -Recurse | Select-String -Pattern \'{pattern}\' | Select-Object -First {limit} | ForEach-Object {{ \"$($_.Filename):$($_.LineNumber):$($_.Line)\" }}"'
     else:
         # Linux/macOS: use ripgrep (rg) with fallback to grep
         rg_check = node_exec(node_id, "which rg", timeout=5)
@@ -163,21 +169,41 @@ def node_search(node_id: str, pattern: str, path: str = ".", file_glob: str = No
     stdout = payload.get("output", "")
     
     # Parse results
+    # Format: filename:line_number:content
+    # Windows paths like C:\dir\file.cs:10:content need special handling
     entries = []
     for line in stdout.strip().split("\n"):
         if not line:
             continue
         
-        # Format: filename:line_number:content (rg/grep) or filename:line (Select-String)
-        parts = line.split(":", 2)
-        if len(parts) >= 2:
+        # Handle Windows paths: C:\dir\file.cs:10:content
+        # The line number is the last numeric segment before content
+        # Strategy: find the first ':' that is followed by digits and another ':'
+        match = None
+        for m in __import__('re').finditer(r':(\d+):', line):
+            match = m
+        
+        if match:
+            # file path is everything before the first match
+            file_path = line[:match.start()]
+            line_num = int(match.group(1))
+            content = line[match.end():]
             entries.append({
-                "file": parts[0],
-                "line": int(parts[1]) if parts[1].isdigit() else 0,
-                "content": parts[2] if len(parts) > 2 else "",
+                "file": file_path,
+                "line": line_num,
+                "content": content,
             })
         else:
-            entries.append({"file": line, "line": 0, "content": ""})
+            # Fallback: try simple split (for non-Windows or simple paths)
+            parts = line.split(":", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                entries.append({
+                    "file": parts[0],
+                    "line": int(parts[1]),
+                    "content": parts[2] if len(parts) > 2 else "",
+                })
+            else:
+                entries.append({"file": line, "line": 0, "content": ""})
     
     return entries[:limit]
 
@@ -207,15 +233,16 @@ def node_find_files(node_id: str, pattern: str, path: str = ".", limit: int = 50
 
 
 # Tool registration
-if __name__ != "__main__":
-    try:
-        from tools.registry import register
-        
-        register(
-            name="node_read",
-            fn=node_read,
-            description="Read a file from a local or remote node",
-            parameters={
+try:
+    from tools.registry import registry
+    
+    registry.register(
+        name="node_read",
+        toolset="node",
+        schema={
+            "name": "node_read",
+            "description": "Read a file from a local or remote node",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
@@ -223,12 +250,19 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "path"],
             },
-        )
-        register(
-            name="node_write",
-            fn=node_write,
-            description="Write a file to a local or remote node",
-            parameters={
+        },
+        handler=lambda args, **kw: node_read(
+            node_id=args.get("node_id", ""),
+            path=args.get("path", ""),
+        ),
+    )
+    registry.register(
+        name="node_write",
+        toolset="node",
+        schema={
+            "name": "node_write",
+            "description": "Write a file to a local or remote node",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
@@ -237,12 +271,20 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "path", "content"],
             },
-        )
-        register(
-            name="node_patch",
-            fn=node_patch,
-            description="Apply content-based patches to a file on a node",
-            parameters={
+        },
+        handler=lambda args, **kw: node_write(
+            node_id=args.get("node_id", ""),
+            path=args.get("path", ""),
+            content=args.get("content", ""),
+        ),
+    )
+    registry.register(
+        name="node_patch",
+        toolset="node",
+        schema={
+            "name": "node_patch",
+            "description": "Apply content-based patches to a file on a node",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
@@ -262,12 +304,20 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "path", "changes"],
             },
-        )
-        register(
-            name="node_exec",
-            fn=node_exec,
-            description="Execute a command on a local or remote node",
-            parameters={
+        },
+        handler=lambda args, **kw: node_patch(
+            node_id=args.get("node_id", ""),
+            path=args.get("path", ""),
+            changes=args.get("changes", []),
+        ),
+    )
+    registry.register(
+        name="node_exec",
+        toolset="node",
+        schema={
+            "name": "node_exec",
+            "description": "Execute a command on a local or remote node",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
@@ -276,12 +326,20 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "cmd"],
             },
-        )
-        register(
-            name="node_list_dir",
-            fn=node_list_dir,
-            description="List directory contents on a local or remote node",
-            parameters={
+        },
+        handler=lambda args, **kw: node_exec(
+            node_id=args.get("node_id", ""),
+            cmd=args.get("cmd", ""),
+            timeout=args.get("timeout", 30),
+        ),
+    )
+    registry.register(
+        name="node_list_dir",
+        toolset="node",
+        schema={
+            "name": "node_list_dir",
+            "description": "List directory contents on a local or remote node",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
@@ -289,12 +347,19 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "path"],
             },
-        )
-        register(
-            name="node_search",
-            fn=node_search,
-            description="Search file contents on a node (OS-agnostic: uses ripgrep on Linux, PowerShell on Windows)",
-            parameters={
+        },
+        handler=lambda args, **kw: node_list_dir(
+            node_id=args.get("node_id", ""),
+            path=args.get("path", ""),
+        ),
+    )
+    registry.register(
+        name="node_search",
+        toolset="node",
+        schema={
+            "name": "node_search",
+            "description": "Search file contents on a node (OS-agnostic: uses ripgrep on Linux, PowerShell on Windows)",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
@@ -306,12 +371,23 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "pattern"],
             },
-        )
-        register(
-            name="node_find_files",
-            fn=node_find_files,
-            description="Find files by name pattern on a node (OS-agnostic)",
-            parameters={
+        },
+        handler=lambda args, **kw: node_search(
+            node_id=args.get("node_id", ""),
+            pattern=args.get("pattern", ""),
+            path=args.get("path", "."),
+            file_glob=args.get("file_glob"),
+            target=args.get("target", "content"),
+            limit=args.get("limit", 50),
+        ),
+    )
+    registry.register(
+        name="node_find_files",
+        toolset="node",
+        schema={
+            "name": "node_find_files",
+            "description": "Find files by name pattern on a node (OS-agnostic)",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
@@ -321,6 +397,13 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "pattern"],
             },
-        )
-    except ImportError:
-        pass
+        },
+        handler=lambda args, **kw: node_find_files(
+            node_id=args.get("node_id", ""),
+            pattern=args.get("pattern", ""),
+            path=args.get("path", "."),
+            limit=args.get("limit", 50),
+        ),
+    )
+except ImportError:
+    pass
