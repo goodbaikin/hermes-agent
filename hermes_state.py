@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tool_call_count INTEGER DEFAULT 0,
     input_tokens INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
+    current_prompt_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
@@ -565,6 +566,15 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def update_current_prompt_tokens(self, session_id: str, prompt_tokens: int) -> None:
+        """Update the current_prompt_tokens for a session."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET current_prompt_tokens = ? WHERE id = ?",
+                (prompt_tokens, session_id),
+            )
+        self._execute_write(_do)
+
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):
@@ -759,11 +769,20 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
-        with self._lock:
+        try:
             cursor = self._conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                time.sleep(0.05)
+                cursor = self._conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                )
+                row = cursor.fetchone()
+            else:
+                raise
         return dict(row) if row else None
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
@@ -783,12 +802,22 @@ class SessionDB:
             .replace("%", "\\%")
             .replace("_", "\\_")
         )
-        with self._lock:
+        try:
             cursor = self._conn.execute(
                 "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
                 (f"{escaped}%",),
             )
             matches = [row["id"] for row in cursor.fetchall()]
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                time.sleep(0.05)
+                cursor = self._conn.execute(
+                    "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
+                    (f"{escaped}%",),
+                )
+                matches = [row["id"] for row in cursor.fetchall()]
+            else:
+                raise
         if len(matches) == 1:
             return matches[0]
         return None
@@ -1424,14 +1453,38 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages for a session, ordered by timestamp."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
-                (session_id,),
-            )
+    def get_messages(self, session_id: str, limit: int = None, offset: int = 0) -> List[Dict[str, Any]]:
+        """Load messages for a session, ordered by timestamp."""
+        # Read-only: no need for write lock
+        try:
+            if limit is not None:
+                cursor = self._conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id LIMIT ? OFFSET ?",
+                    (session_id, limit, offset),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+                    (session_id,),
+                )
             rows = cursor.fetchall()
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                # Retry once after short delay
+                time.sleep(0.05)
+                if limit is not None:
+                    cursor = self._conn.execute(
+                        "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id LIMIT ? OFFSET ?",
+                        (session_id, limit, offset),
+                    )
+                else:
+                    cursor = self._conn.execute(
+                        "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+                        (session_id,),
+                    )
+                rows = cursor.fetchall()
+            else:
+                raise
         result = []
         for row in rows:
             msg = dict(row)
@@ -1993,7 +2046,7 @@ class SessionDB:
 
     def session_count(self, source: str = None) -> int:
         """Count sessions, optionally filtered by source."""
-        with self._lock:
+        try:
             if source:
                 cursor = self._conn.execute(
                     "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
@@ -2001,10 +2054,21 @@ class SessionDB:
             else:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
             return cursor.fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                time.sleep(0.05)
+                if source:
+                    cursor = self._conn.execute(
+                        "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
+                    )
+                else:
+                    cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
+                return cursor.fetchone()[0]
+            raise
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
-        with self._lock:
+        try:
             if session_id:
                 cursor = self._conn.execute(
                     "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
@@ -2012,6 +2076,17 @@ class SessionDB:
             else:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
             return cursor.fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                time.sleep(0.05)
+                if session_id:
+                    cursor = self._conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+                    )
+                else:
+                    cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
+                return cursor.fetchone()[0]
+            raise
 
     # =========================================================================
     # Export and cleanup

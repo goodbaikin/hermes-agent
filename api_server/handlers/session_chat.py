@@ -368,20 +368,34 @@ async def handle_session_chat_stream(
         except Exception:
             logger.debug("Auto-title failed for session %s", session_id, exc_info=True)
 
-        tools = _tool_map(result.get("messages") or [])
-        for item in result.get("messages") or []:
-            if item.get("role") != "tool":
-                continue
-            tool_id = item.get("tool_call_id")
-            tool_meta = tools.get(tool_id, {})
-            await response.write(_encode_sse("tool.completed", {
-                "session_id": session_id,
-                "run_id": run_id,
-                "tool_call_id": tool_id,
-                "tool_name": tool_meta.get("tool_name") or item.get("tool_name") or "unknown",
-                "args": tool_meta.get("args"),
-                "result_preview": _result_preview(item.get("content")),
-            }))
+        # Build usage from agent result
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+        try:
+            agent = agent_ref[0]
+            if agent is not None:
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                logger.info("[session_chat] Agent usage for %s: input=%s output=%s total=%s",
+                           session_id, usage["input_tokens"], usage["output_tokens"], usage["total_tokens"])
+                # Save current prompt tokens to session DB for context gauge
+                try:
+                    db._execute_write(lambda conn: conn.execute(
+                        "UPDATE sessions SET current_prompt_tokens = ? WHERE id = ?",
+                        (usage["input_tokens"], session_id)
+                    ))
+                    logger.info("[session_chat] Saved current_prompt_tokens=%s for session %s",
+                               usage["input_tokens"], session_id)
+                except Exception as e:
+                    logger.error("[session_chat] Failed to save current_prompt_tokens: %s", e)
+        except Exception as e:
+            logger.error("[session_chat] Error building usage: %s", e)
 
         await response.write(_encode_sse("assistant.completed", {
             "session_id": session_id,
@@ -400,6 +414,7 @@ async def handle_session_chat_stream(
             "partial": result.get("partial", False),
             "interrupted": result.get("interrupted", False),
             "api_calls": result.get("api_calls"),
+            "usage": usage,
         }))
         await response.write(_encode_sse("done", {"session_id": session_id, "run_id": run_id, "state": "final"}))
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):

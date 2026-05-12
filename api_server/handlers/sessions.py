@@ -33,6 +33,7 @@ def _normalize_session_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]
         "tool_call_count": normalized.get("tool_call_count") or 0,
         "input_tokens": normalized.get("input_tokens") or 0,
         "output_tokens": normalized.get("output_tokens") or 0,
+        "current_prompt_tokens": normalized.get("current_prompt_tokens") or 0,
         "last_active": normalized.get("last_active"),
         "parent_session_id": normalized.get("parent_session_id"),
         "model_config": normalized.get("model_config"),
@@ -171,6 +172,7 @@ async def handle_delete_session(request: web.Request, *, check_auth, ensure_sess
 
 
 async def handle_get_session_messages(request: web.Request, *, check_auth, ensure_session_db) -> web.Response:
+    t_start = time.time()
     auth_err = check_auth(request)
     if auth_err:
         return auth_err
@@ -182,8 +184,21 @@ async def handle_get_session_messages(request: web.Request, *, check_auth, ensur
         resolved = db.resolve_session_id(session_id) or session_id
         if db.get_session(resolved) is None:
             db.ensure_session(resolved, source="web")
-        items = db.get_messages(resolved)
-        return web.json_response({"items": items, "total": len(items)})
+        from api_server.utils import _parse_int
+        limit = _parse_int(request.query.get("limit"), None)
+        offset = _parse_int(request.query.get("offset"), 0)
+        t_db = time.time()
+        items = db.get_messages(resolved, limit=limit, offset=offset)
+        t_items = time.time()
+        # Get total count for pagination info
+        total = db.message_count(resolved) if hasattr(db, 'message_count') else len(items)
+        t_total = time.time()
+        elapsed = (t_total - t_start) * 1000
+        db_elapsed = (t_items - t_db) * 1000
+        count_elapsed = (t_total - t_items) * 1000
+        if elapsed > 50:
+            logger.warning(f"[SLOW MSG] session={resolved} total={elapsed:.0f}ms db={db_elapsed:.0f}ms count={count_elapsed:.0f}ms items={len(items)} limit={limit}")
+        return web.json_response({"items": items, "total": total, "limit": limit, "offset": offset})
     except Exception as e:
         logger.exception("Error getting session messages")
         return web.json_response({"error": str(e)}, status=500)
