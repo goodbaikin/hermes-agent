@@ -54,6 +54,11 @@ def node_describe(node_id: str) -> str:
 
 def node_invoke(node_id: str, command: str, params: Optional[Dict[str, Any]] = None, timeout_ms: int = 30000) -> str:
     """Invoke a command on a remote node."""
+    
+    # ローカルノードの場合は直接実行
+    if node_id == "local":
+        return _execute_local(command, params or {})
+    
     body = {
         "command": command,
         "params": params or {},
@@ -61,6 +66,16 @@ def node_invoke(node_id: str, command: str, params: Optional[Dict[str, Any]] = N
     }
     result = _api_request(f"/v1/nodes/{node_id}/invoke", method="POST", body=body)
     return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _execute_local(command: str, params: Dict[str, Any]) -> str:
+    """ローカルで直接ツール実行"""
+    try:
+        from model_tools import handle_function_call
+        result = handle_function_call(command, params)
+        return json.dumps({"ok": True, "payload": result}, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": {"code": "LOCAL_EXEC_FAILED", "message": str(e)}}, ensure_ascii=False)
 
 
 # Tool registration

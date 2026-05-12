@@ -54,6 +54,10 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Node operations (remote/local)
+    "node_list", "node_describe", "node_invoke",
+    "node_read", "node_write", "node_patch", "node_exec", "node_list_dir",
+    "node_search", "node_find_files",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
