@@ -865,6 +865,20 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
         ]
 
+    def __del__(self):
+        """Best-effort cleanup of the aiohttp session on garbage collection.
+
+        Hindsight's auto-generated OpenAPI client (hindsight-client-api) does
+        not close its internal aiohttp.ClientSession on __del__, so without
+        this hook every discarded AIAgent leaks an unclosed session warning.
+        """
+        client = getattr(self, "_client", None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def _get_client(self):
         """Return the cached Hindsight client (created once, reused)."""
         if self._client is None:
