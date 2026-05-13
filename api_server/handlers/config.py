@@ -132,23 +132,23 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
     # Kimi
-    "kimi-k2-6": 256000,
-    "kimi-k2-5": 256000,
-    "kimi-for-coding": 256000,
-    "kimi-k2-thinking": 256000,
-    "kimi-k2-thinking-turbo": 256000,
-    "kimi-k2-turbo-preview": 256000,
-    "kimi-k2-0905-preview": 256000,
+    "kimi-k2-6": 262144,
+    "kimi-k2-5": 262144,
+    "kimi-for-coding": 262144,
+    "kimi-k2-thinking": 262144,
+    "kimi-k2-thinking-turbo": 262144,
+    "kimi-k2-turbo-preview": 262144,
+    "kimi-k2-0905-preview": 262144,
     # DeepSeek
-    "deepseek-v4-pro": 64000,
-    "deepseek-v4-flash": 64000,
-    "deepseek-chat": 64000,
-    "deepseek-reasoner": 64000,
+    "deepseek-v4-pro": 1000000,
+    "deepseek-v4-flash": 1000000,
+    "deepseek-chat": 1000000,
+    "deepseek-reasoner": 1000000,
     # Google
-    "gemini-3-pro-preview": 1000000,
-    "gemini-3-flash-preview": 1000000,
-    "gemini-3-1-pro-preview": 1000000,
-    "gemini-3-1-flash-lite-preview": 1000000,
+    "gemini-3-pro-preview": 1048576,
+    "gemini-3-flash-preview": 1048576,
+    "gemini-3-1-pro-preview": 1048576,
+    "gemini-3-1-flash-lite-preview": 1048576,
     # Qwen
     "qwen3-6-plus": 128000,
     "qwen3-5-plus-02-15": 128000,
@@ -186,11 +186,11 @@ def _get_model_context_window(model_id: str) -> int:
     if "claude" in raw:
         return 200000
     if "kimi" in raw:
-        return 256000
+        return 262144
     if "deepseek" in raw:
-        return 64000
-    if "gemini" in raw:
         return 1000000
+    if "gemini" in raw:
+        return 1048576
     if "grok" in raw:
         return 128000
     if "glm" in raw:

@@ -105,18 +105,19 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
 
     try:
         if tool_name == "read_file":
-            text = node_lib.node_read(node_id, params.get("path", ""))
-            # Apply pagination
             offset = params.get("offset", 1)
             limit = params.get("limit", 500)
             from tools.file_operations import normalize_read_pagination
             offset, limit = normalize_read_pagination(offset, limit)
+            text = node_lib.node_read(
+                node_id, params.get("path", ""),
+                offset=offset,
+                limit=limit,
+            )
+            # Apply line numbers to the paginated result
             lines = text.split("\n")
-            start = max(0, offset - 1)
-            end = min(len(lines), start + limit)
-            selected = lines[start:end]
             result = []
-            for i, line in enumerate(selected, start=offset):
+            for i, line in enumerate(lines, start=offset):
                 result.append(f"{i:>5}|{line}")
             return "\n".join(result)
 

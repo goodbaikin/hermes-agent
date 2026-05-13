@@ -379,8 +379,14 @@ async def handle_session_chat_stream(
         try:
             agent = agent_ref[0]
             if agent is not None:
+                # Use last_prompt_tokens (current turn) instead of session_prompt_tokens (cumulative)
+                last_prompt = 0
+                try:
+                    last_prompt = getattr(agent.context_compressor, "last_prompt_tokens", 0) or 0
+                except Exception:
+                    last_prompt = getattr(agent, "session_prompt_tokens", 0) or 0
                 usage = {
-                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "input_tokens": last_prompt,
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                     "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                 }
@@ -390,10 +396,10 @@ async def handle_session_chat_stream(
                 try:
                     db._execute_write(lambda conn: conn.execute(
                         "UPDATE sessions SET current_prompt_tokens = ? WHERE id = ?",
-                        (usage["input_tokens"], session_id)
+                        (last_prompt, session_id)
                     ))
                     logger.info("[session_chat] Saved current_prompt_tokens=%s for session %s",
-                               usage["input_tokens"], session_id)
+                               last_prompt, session_id)
                 except Exception as e:
                     logger.error("[session_chat] Failed to save current_prompt_tokens: %s", e)
         except Exception as e:

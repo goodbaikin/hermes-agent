@@ -73,6 +73,7 @@ COMMANDS = {
     "search.files",
     "msbuild",
     "signtool",
+    "node.restart",
 }
 
 DEFAULT_TIMEOUT_SEC = 30
@@ -95,7 +96,8 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
     env["PYTHONIOENCODING"] = "utf-8"
 
     # On Windows: use PowerShell with UTF-8 encoding, bypassing cmd.exe AutoRun
-    if sys.platform == "win32":
+    # Skip wrapping if the command already invokes PowerShell/pwsh directly
+    if sys.platform == "win32" and not cmd.strip().lower().startswith(("powershell", "pwsh")):
         # Build PowerShell command as argument list to avoid shell escaping issues
         # Use -EncodedCommand for complex commands to avoid quoting hell
         # Set $ErrorView to NormalView to prevent CLIXML output in stderr
@@ -161,9 +163,18 @@ def _normalize_crlf(text: str) -> str:
 
 
 async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
-    """Read a file locally. Supports binary (base64) or text (UTF-8)."""
+    """Read a file locally. Supports binary (base64) or text (UTF-8).
+    
+    Args:
+        path: File path to read
+        encoding: Text encoding (default: binary/base64)
+        offset: Line number to start from (1-based, for text mode)
+        limit: Maximum lines to return (for text mode)
+    """
     path = Path(params["path"])
     encoding = params.get("encoding")
+    offset = params.get("offset", 1)
+    limit = params.get("limit")
 
     if path.is_dir():
         return {"error": f"Path is a directory: {path}"}
@@ -175,7 +186,18 @@ async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
         # Normalize CRLF to LF for consistent cross-platform handling
         if "\r\n" in text:
             text = text.replace("\r\n", "\n")
-        return {"content": text, "encoding": encoding}
+        lines = text.split("\n")
+        total_lines = len(lines)
+        start = max(0, offset - 1)
+        end = len(lines) if limit is None else min(len(lines), start + limit)
+        selected = lines[start:end]
+        return {
+            "content": "\n".join(selected),
+            "encoding": encoding,
+            "offset": offset,
+            "limit": limit,
+            "total_lines": total_lines,
+        }
     else:
         with open(path, "rb") as f:
             return {"content": base64.b64encode(f.read()).decode(), "binary": True}
@@ -378,6 +400,54 @@ async def handle_signtool(params: dict[str, Any]) -> dict[str, Any]:
     return await handle_terminal_exec({"cmd": cmd, "timeoutMs": 60000})
 
 
+async def handle_node_restart(params: dict[str, Any]) -> dict[str, Any]:
+    """Restart the node client process. Spawns a new process then exits self."""
+    import subprocess
+    import sys
+    import os
+
+    # Get the path to this script
+    script_path = os.path.abspath(__file__)
+
+    # Build the same command line that was used to start this process
+    # Use pythonw on Windows to avoid console window
+    python_exe = sys.executable
+    if sys.platform == "win32" and not python_exe.lower().endswith("pythonw.exe"):
+        python_exe = python_exe.replace("python.exe", "pythonw.exe")
+
+    args = [python_exe, script_path]
+
+    # Pass through original CLI args if available, otherwise use env defaults
+    # We can't easily access original CLI args here, so use the connect params
+    # The new process will reconnect with the same config
+
+    logger.info("[%s] Spawning restart process: %s", NODE_ID, args)
+
+    # Start new process detached (no console window on Windows)
+    if sys.platform == "win32":
+        subprocess.Popen(
+            args,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+            close_fds=True,
+        )
+    else:
+        subprocess.Popen(
+            args,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    # Schedule self-termination after sending response
+    async def _delayed_exit():
+        await asyncio.sleep(1)
+        logger.info("[%s] Exiting for restart.", NODE_ID)
+        os._exit(0)
+
+    asyncio.create_task(_delayed_exit())
+
+    return {"restarting": True, "nodeId": NODE_ID}
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -392,6 +462,7 @@ HANDLERS = {
     "search.files": handle_search_files,
     "msbuild": handle_msbuild,
     "signtool": handle_signtool,
+    "node.restart": handle_node_restart,
 }
 
 

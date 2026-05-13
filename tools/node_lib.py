@@ -31,14 +31,31 @@ def _parse_result(result_str: str) -> Dict[str, Any]:
     return result
 
 
-def node_read(node_id: str, path: str) -> str:
-    """Read a file from a node (text)."""
+def node_read(node_id: str, path: str, offset: int = 1, limit: int = None) -> str:
+    """Read a file from a node (text). Supports pagination via offset/limit."""
     # Expand ~ to home directory
     if path.startswith("~"):
         import os
         path = os.path.expanduser(path)
+    elif not path.startswith("/") and not path.startswith("C:"):
+        # Resolve relative path
+        if node_id == "local":
+            import os
+            path = os.path.abspath(path)
+        else:
+            # For remote Windows nodes, resolve relative to workspace dir
+            if node_id.startswith("dev-win") or node_id.startswith("win-"):
+                path = f"C:/Users/goodb/workspace/{path}"
+            else:
+                path = f"/home/node/workspace/{path}"
     
-    result_str = node_invoke(node_id, "file.read", {"path": path})
+    params = {"path": path, "encoding": "utf-8"}
+    if offset is not None:
+        params["offset"] = offset
+    if limit is not None:
+        params["limit"] = limit
+    
+    result_str = node_invoke(node_id, "file.read", params)
     result = _parse_result(result_str)
     
     payload = result["payload"]
@@ -54,6 +71,17 @@ def node_write(node_id: str, path: str, content: str) -> Dict[str, Any]:
     if path.startswith("~"):
         import os
         path = os.path.expanduser(path)
+    elif not path.startswith("/") and not path.startswith("C:"):
+        # Resolve relative path
+        if node_id == "local":
+            import os
+            path = os.path.abspath(path)
+        else:
+            # For remote Windows nodes, resolve relative to workspace dir
+            if node_id.startswith("dev-win") or node_id.startswith("win-"):
+                path = f"C:/Users/goodb/workspace/{path}"
+            else:
+                path = f"/home/node/workspace/{path}"
     
     content_b64 = base64.b64encode(content.encode("utf-8")).decode()
     result_str = node_invoke(node_id, "file.write", {
@@ -124,6 +152,13 @@ def node_search(node_id: str, pattern: str, path: str = ".", file_glob: str = No
         if node_id == "local":
             import os
             path = os.path.abspath(path)
+        else:
+            # For remote Windows nodes, resolve relative to workspace dir
+            # TODO: make this configurable per-node
+            if node_id.startswith("dev-win") or node_id.startswith("win-"):
+                path = f"C:/Users/goodb/workspace/{path}"
+            else:
+                path = f"/home/node/workspace/{path}"
     
     if target == "files":
         result_str = node_invoke(node_id, "search.files", {
@@ -170,6 +205,12 @@ def node_find_files(node_id: str, pattern: str, path: str = ".", limit: int = 50
         if node_id == "local":
             import os
             path = os.path.abspath(path)
+        else:
+            # For remote Windows nodes, resolve relative to workspace dir
+            if node_id.startswith("dev-win") or node_id.startswith("win-"):
+                path = f"C:/Users/goodb/workspace/{path}"
+            else:
+                path = f"/home/node/workspace/{path}"
     
     result_str = node_invoke(node_id, "search.files", {
         "pattern": pattern,
