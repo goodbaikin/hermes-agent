@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # Tools that support workspace-based routing
 _WORKSPACE_TOOLS = {
     "read_file", "write_file", "patch", "search_files",
-    "terminal", "execute_code",
+    "terminal", "execute_code", "computer_use",
 }
 
 
@@ -165,6 +165,22 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
 
         elif tool_name == "execute_code":
             return _route_execute_code(node_id, params)
+
+        elif tool_name == "computer_use":
+            action = params.get("action", "")
+            cu_params = {"action": action}
+            # Forward all known computer_use params
+            for key in ["x", "y", "x2", "y2", "text", "keys", "direction", "amount", "ms", "region", "redact_regions"]:
+                if key in params:
+                    cu_params[key] = params[key]
+            result = node_lib.node_invoke(node_id, "computer.use", cu_params)
+            # node_invoke returns JSON string; parse and return
+            parsed = json.loads(result)
+            if parsed.get("ok"):
+                payload = parsed.get("payload", {})
+                return json.dumps(payload, ensure_ascii=False)
+            else:
+                return json.dumps({"error": parsed.get("error", {}).get("message", "Unknown error")}, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("Workspace routing failed for %s on %s: %s", tool_name, node_id, e)

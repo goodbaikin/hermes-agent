@@ -224,6 +224,103 @@ def node_find_files(node_id: str, pattern: str, path: str = ".", limit: int = 50
     return [m.get("path", "") for m in payload.get("matches", [])]
 
 
+# ---------------------------------------------------------------------------
+# Computer Use wrappers
+# ---------------------------------------------------------------------------
+
+def node_screenshot(node_id: str, region: list = None, redact_regions: list = None) -> dict:
+    """Take a screenshot on a remote node. Returns dict with screenshot_b64."""
+    params = {"action": "screenshot"}
+    if region:
+        params["region"] = region
+    if redact_regions:
+        params["redact_regions"] = redact_regions
+    result_str = node_invoke(node_id, "computer.use", params)
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_click(node_id: str, x: int, y: int, button: str = "left") -> dict:
+    """Click at coordinates on a remote node."""
+    action_map = {
+        "left": "left_click",
+        "right": "right_click",
+        "middle": "middle_click",
+    }
+    result_str = node_invoke(node_id, "computer.use", {
+        "action": action_map.get(button, "left_click"),
+        "x": x, "y": y,
+    })
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_double_click(node_id: str, x: int, y: int) -> dict:
+    """Double-click at coordinates on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {
+        "action": "double_click", "x": x, "y": y,
+    })
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_mouse_move(node_id: str, x: int, y: int) -> dict:
+    """Move mouse to coordinates on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {
+        "action": "mouse_move", "x": x, "y": y,
+    })
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_drag(node_id: str, x1: int, y1: int, x2: int, y2: int) -> dict:
+    """Drag from (x1,y1) to (x2,y2) on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {
+        "action": "mouse_drag",
+        "x": x1, "y": y1, "x2": x2, "y2": y2,
+    })
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_type(node_id: str, text: str) -> dict:
+    """Type text on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {
+        "action": "type", "text": text,
+    })
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_key(node_id: str, keys: str) -> dict:
+    """Send key combination on a remote node (e.g. 'Win+R', 'Ctrl+C')."""
+    result_str = node_invoke(node_id, "computer.use", {
+        "action": "key", "keys": keys,
+    })
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_scroll(node_id: str, direction: str = "down", amount: int = 3) -> dict:
+    """Scroll on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {
+        "action": "scroll", "direction": direction, "amount": amount,
+    })
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_cursor_position(node_id: str) -> dict:
+    """Get cursor position on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {"action": "cursor_position"})
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_screen_size(node_id: str) -> dict:
+    """Get screen size on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {"action": "screen_size"})
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+def node_get_active_window(node_id: str) -> dict:
+    """Get active window on a remote node."""
+    result_str = node_invoke(node_id, "computer.use", {"action": "get_active_window"})
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+
 # Tool registration
 try:
     from tools.registry import registry
