@@ -193,6 +193,11 @@ class StandaloneAPIServer:
         self._session_db: Optional[SessionDB] = None
         self._memory_store: Optional[MemoryStore] = None
         self._running = False
+        # Session-scoped AIAgent cache — reuse agents across turns for the same
+        # session to avoid rebuilding tool schemas, memory providers, and LLM
+        # clients on every request (fixes unclosed aiohttp session leaks).
+        self._session_agent_cache: Dict[str, Any] = {}
+        self._session_agent_cache_lock = asyncio.Lock()
 
 
     @staticmethod
@@ -406,7 +411,29 @@ class StandaloneAPIServer:
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
+
+        When *session_id* is provided, the agent is cached and reused for
+        subsequent requests to the same session. This avoids rebuilding tool
+        schemas, memory providers, and LLM clients on every request.
         """
+        # Return cached agent for this session if available and config matches
+        if session_id:
+            cached = self._session_agent_cache.get(session_id)
+            if cached is not None:
+                # Update callbacks (they may differ per request)
+                if stream_delta_callback:
+                    cached.stream_delta_callback = stream_delta_callback
+                if tool_progress_callback:
+                    cached.tool_progress_callback = tool_progress_callback
+                if tool_start_callback:
+                    cached.tool_start_callback = tool_start_callback
+                if tool_complete_callback:
+                    cached.tool_complete_callback = tool_complete_callback
+                # Update ephemeral system prompt if provided
+                if ephemeral_system_prompt is not None:
+                    cached.ephemeral_system_prompt = ephemeral_system_prompt
+                return cached
+
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
         from hermes_cli.tools_config import _get_platform_tools
@@ -444,6 +471,10 @@ class StandaloneAPIServer:
             reasoning_config=reasoning_config,
             workspace=workspace,
         )
+
+        if session_id:
+            self._session_agent_cache[session_id] = agent
+
         return agent
 
     # ------------------------------------------------------------------
@@ -528,11 +559,22 @@ class StandaloneAPIServer:
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id} -- delete a session."""
         from api_server.handlers.sessions import handle_delete_session
-        return await handle_delete_session(
+        session_id = request.match_info.get("session_id", "")
+        response = await handle_delete_session(
             request,
             check_auth=self._check_auth,
             ensure_session_db=self._ensure_session_db,
         )
+        # Evict cached agent for this session so we don't leak memory or
+        # keep stale providers (e.g. unclosed aiohttp sessions) alive.
+        if response.status == 200 and session_id in self._session_agent_cache:
+            agent = self._session_agent_cache.pop(session_id, None)
+            if agent is not None and hasattr(agent, 'memory_manager') and agent.memory_manager is not None:
+                try:
+                    agent.memory_manager.shutdown_all()
+                except Exception:
+                    pass
+        return response
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork -- clone a session and its messages."""
