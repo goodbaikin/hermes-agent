@@ -31,6 +31,7 @@ def create_agent(
     ephemeral_system_prompt: Optional[str] = None,
     session_id: Optional[str] = None,
     session_db: Any = None,
+    workspace: Optional[str] = None,
 ) -> Any:
     """Create an AIAgent using API Server configuration only.
 
@@ -40,6 +41,7 @@ def create_agent(
         ephemeral_system_prompt: One-shot system prompt override.
         session_id: Session ID for persistence.
         session_db: Optional SessionDB instance.
+        workspace: Workspace directory or identifier for the agent session.
 
     Returns:
         An AIAgent instance.
@@ -67,6 +69,7 @@ def create_agent(
         "session_db": session_db,
         "fallback_model": config.fallback_model,
         "reasoning_config": config.reasoning_config,
+        "workspace": workspace,
     }
 
     if callbacks.stream_delta_callback:

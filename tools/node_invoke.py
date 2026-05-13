@@ -79,33 +79,47 @@ def _execute_local(command: str, params: Dict[str, Any]) -> str:
 
 
 # Tool registration
-if __name__ != "__main__":
-    try:
-        from tools.registry import register
-        
-        register(
-            name="node_list",
-            fn=node_list,
-            description="List all connected remote nodes",
-            parameters={},
-        )
-        register(
-            name="node_describe",
-            fn=node_describe,
-            description="Describe a specific remote node",
-            parameters={
+try:
+    from tools.registry import registry
+    
+    registry.register(
+        name="node_list",
+        toolset="node",
+        schema={
+            "name": "node_list",
+            "description": "List all connected remote nodes",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        handler=lambda args, **kw: node_list(),
+    )
+    registry.register(
+        name="node_describe",
+        toolset="node",
+        schema={
+            "name": "node_describe",
+            "description": "Describe a specific remote node",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID to describe"},
                 },
                 "required": ["node_id"],
             },
-        )
-        register(
-            name="node_invoke",
-            fn=node_invoke,
-            description="Invoke a command on a remote node",
-            parameters={
+        },
+        handler=lambda args, **kw: node_describe(
+            node_id=args.get("node_id", ""),
+        ),
+    )
+    registry.register(
+        name="node_invoke",
+        toolset="node",
+        schema={
+            "name": "node_invoke",
+            "description": "Invoke a command on a remote node",
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID to invoke"},
@@ -115,6 +129,13 @@ if __name__ != "__main__":
                 },
                 "required": ["node_id", "command"],
             },
-        )
-    except ImportError:
-        pass
+        },
+        handler=lambda args, **kw: node_invoke(
+            node_id=args.get("node_id", ""),
+            command=args.get("command", ""),
+            params=args.get("params"),
+            timeout_ms=args.get("timeout_ms", 30000),
+        ),
+    )
+except ImportError:
+    pass

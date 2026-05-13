@@ -857,7 +857,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         _paths_to_check.append(path)
     if mode == "patch" and patch:
         import re as _re
-        for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
+        for _m in _re.finditer(r'^\*\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)

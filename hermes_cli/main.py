@@ -1464,6 +1464,7 @@ def cmd_chat(args):
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False),
+        "workspace": getattr(args, "workspace", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

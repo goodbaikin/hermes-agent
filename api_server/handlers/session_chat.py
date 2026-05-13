@@ -64,6 +64,7 @@ async def handle_session_chat(
         agent = create_agent(
             ephemeral_system_prompt=system_message,
             session_id=session_id,
+            workspace=session.get("workspace"),
         )
         agent._session_db = db  # Enable session persistence
         result = agent.run_conversation(
@@ -264,6 +265,7 @@ async def handle_session_chat_stream(
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_make_tool_complete_callback(run_id, loop),
+                workspace=session.get("workspace"),
             )
             agent._session_db = db  # Enable session persistence
             agent_ref[0] = agent

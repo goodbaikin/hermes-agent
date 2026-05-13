@@ -26,6 +26,7 @@ def _normalize_session_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]
         "user_id": normalized.get("user_id"),
         "model": normalized.get("model"),
         "title": normalized.get("title"),
+        "workspace": normalized.get("workspace"),
         "started_at": normalized.get("started_at"),
         "ended_at": normalized.get("ended_at"),
         "end_reason": normalized.get("end_reason"),
@@ -99,6 +100,7 @@ async def handle_create_session(request: web.Request, *, check_auth, ensure_sess
         source = str(body.get("source") or "api_server").strip() or "api_server"
         model = str(body.get("model") or "").strip() or None
         system_prompt = str(body.get("system_prompt") or "").strip() or None
+        workspace = str(body.get("workspace") or "").strip() or None
         db = ensure_session_db()
         if not db:
             return web.json_response({"error": "Session DB unavailable"}, status=503)
@@ -107,6 +109,7 @@ async def handle_create_session(request: web.Request, *, check_auth, ensure_sess
             source=source,
             model=model,
             system_prompt=system_prompt,
+            workspace=workspace,
         )
         if title:
             try:

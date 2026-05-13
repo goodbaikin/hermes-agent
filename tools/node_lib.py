@@ -117,119 +117,70 @@ def node_list_dir(node_id: str, path: str) -> List[Dict[str, Any]]:
 
 def node_search(node_id: str, pattern: str, path: str = ".", file_glob: str = None, 
                 target: str = "content", limit: int = 50) -> List[Dict[str, Any]]:
-    """Search files on a node (OS-agnostic wrapper for ripgrep/findstr/grep)."""
+    """Search files on a node using native node commands (search.content/search.files)."""
     
-    # Resolve relative path to absolute
-    if not path.startswith("/") and not path.startswith("~"):
-        # For local node, resolve relative to current working directory
+    # Resolve relative path to absolute for local node
+    if not path.startswith("/") and not path.startswith("~") and not path.startswith("C:"):
         if node_id == "local":
             import os
             path = os.path.abspath(path)
-        # For remote nodes, assume path is relative to node's home or workspace
-        # (remote nodes should handle path resolution)
     
-    # OS detection
-    os_check = node_exec(node_id, "uname -s", timeout=5)
-    output = os_check.get("payload", {}).get("output", "")
-    is_windows = "Linux" not in output and "Darwin" not in output
-    
-    if is_windows:
-        # Windows: use PowerShell with UTF-8 output encoding
-        # chcp 65001 sets UTF-8, [Console]::OutputEncoding ensures PowerShell uses it
-        ps_prefix = 'powershell -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
-        if target == "files":
-            # Find files by name
-            glob_filter = f"-Filter '{file_glob}'" if file_glob else ""
-            cmd = f'{ps_prefix}Get-ChildItem -Path \'{path}\' {glob_filter} -Recurse -Name"'
-        else:
-            # Search content
-            include_opt = f"-Include '{file_glob}'" if file_glob else ""
-            cmd = f'{ps_prefix}Get-ChildItem -Path \'{path}\' {include_opt} -Recurse | Select-String -Pattern \'{pattern}\' | Select-Object -First {limit} | ForEach-Object {{ \"$($_.Filename):$($_.LineNumber):$($_.Line)\" }}"'
+    if target == "files":
+        result_str = node_invoke(node_id, "search.files", {
+            "pattern": file_glob or pattern,
+            "path": path,
+            "limit": limit,
+        })
     else:
-        # Linux/macOS: use ripgrep (rg) with fallback to grep
-        rg_check = node_exec(node_id, "which rg", timeout=5)
-        has_rg = rg_check.get("payload", {}).get("exit_code", 1) == 0
-        
-        if has_rg:
-            glob_opt = f"-g '{file_glob}'" if file_glob else ""
-            if target == "files":
-                cmd = f"rg {glob_opt} -l '{pattern}' {path} | head -{limit}"
-            else:
-                cmd = f"rg {glob_opt} -n -H '{pattern}' {path} | head -{limit}"
-        else:
-            # Fallback to grep
-            name_opt = f"--include='{file_glob}'" if file_glob else ""
-            if target == "files":
-                cmd = f"grep -rl {name_opt} '{pattern}' {path} | head -{limit}"
-            else:
-                cmd = f"grep -rnH {name_opt} '{pattern}' {path} | head -{limit}"
+        result_str = node_invoke(node_id, "search.content", {
+            "pattern": pattern,
+            "path": path,
+            "file_glob": file_glob,
+            "limit": limit,
+        })
     
-    result = node_exec(node_id, cmd, timeout=30)
-    payload = result.get("payload", {})
-    stdout = payload.get("output", "")
+    result = _parse_result(result_str)
+    payload = result["payload"]
     
-    # Parse results
-    # Format: filename:line_number:content
-    # Windows paths like C:\dir\file.cs:10:content need special handling
-    entries = []
-    for line in stdout.strip().split("\n"):
-        if not line:
-            continue
-        
-        # Handle Windows paths: C:\dir\file.cs:10:content
-        # The line number is the last numeric segment before content
-        # Strategy: find the first ':' that is followed by digits and another ':'
-        match = None
-        for m in __import__('re').finditer(r':(\d+):', line):
-            match = m
-        
-        if match:
-            # file path is everything before the first match
-            file_path = line[:match.start()]
-            line_num = int(match.group(1))
-            content = line[match.end():]
-            entries.append({
-                "file": file_path,
-                "line": line_num,
-                "content": content,
-            })
-        else:
-            # Fallback: try simple split (for non-Windows or simple paths)
-            parts = line.split(":", 2)
-            if len(parts) >= 2 and parts[1].isdigit():
-                entries.append({
-                    "file": parts[0],
-                    "line": int(parts[1]),
-                    "content": parts[2] if len(parts) > 2 else "",
-                })
-            else:
-                entries.append({"file": line, "line": 0, "content": ""})
-    
-    return entries[:limit]
+    if target == "files":
+        return [
+            {
+                "file": m.get("path", ""),
+                "line": 0,
+                "content": "",
+            }
+            for m in payload.get("matches", [])
+        ]
+    else:
+        return [
+            {
+                "file": m.get("path", ""),
+                "line": m.get("line", 0),
+                "content": m.get("content", ""),
+            }
+            for m in payload.get("matches", [])
+        ]
 
 
 def node_find_files(node_id: str, pattern: str, path: str = ".", limit: int = 50) -> List[str]:
-    """Find files by name pattern on a node (OS-agnostic)."""
+    """Find files by name pattern on a node using native search.files command."""
     
-    # Resolve relative path to absolute
-    if not path.startswith("/") and not path.startswith("~"):
+    # Resolve relative path to absolute for local node
+    if not path.startswith("/") and not path.startswith("~") and not path.startswith("C:"):
         if node_id == "local":
             import os
             path = os.path.abspath(path)
     
-    os_check = node_exec(node_id, "uname -s", timeout=5)
-    output = os_check.get("payload", {}).get("output", "")
-    is_windows = "Linux" not in output and "Darwin" not in output
+    result_str = node_invoke(node_id, "search.files", {
+        "pattern": pattern,
+        "path": path,
+        "limit": limit,
+    })
     
-    if is_windows:
-        cmd = f'powershell -Command "Get-ChildItem -Path \'{path}\' -Filter \'{pattern}\' -Recurse -Name | Select-Object -First {limit}"'
-    else:
-        cmd = f"find {path} -name '{pattern}' -type f 2>/dev/null | head -{limit}"
+    result = _parse_result(result_str)
+    payload = result["payload"]
     
-    result = node_exec(node_id, cmd, timeout=30)
-    stdout = result.get("payload", {}).get("output", "")
-    
-    return [line.strip() for line in stdout.strip().split("\n") if line.strip()]
+    return [m.get("path", "") for m in payload.get("matches", [])]
 
 
 # Tool registration

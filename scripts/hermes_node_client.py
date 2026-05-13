@@ -69,6 +69,8 @@ COMMANDS = {
     "file.write",
     "file.delete",
     "file.list",
+    "search.content",
+    "search.files",
     "msbuild",
     "signtool",
 }
@@ -96,10 +98,12 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
     if sys.platform == "win32":
         # Build PowerShell command as argument list to avoid shell escaping issues
         # Use -EncodedCommand for complex commands to avoid quoting hell
+        # Set $ErrorView to NormalView to prevent CLIXML output in stderr
         import base64
         ps_script = (
             '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
             '$OutputEncoding = [System.Text.Encoding]::UTF8; '
+            '$ErrorView = \"NormalView\"; '
             f'{cmd}'
         )
         encoded = base64.b64encode(ps_script.encode('utf-16le')).decode()
@@ -130,10 +134,30 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
         }
 
     return {
-        "stdout": stdout.decode("utf-8", errors="replace"),
-        "stderr": stderr.decode("utf-8", errors="replace").replace("#< CLIXML", "").strip(),
+        "stdout": _normalize_crlf(stdout.decode("utf-8", errors="replace")),
+        "stderr": _normalize_crlf(_strip_clixml(stderr.decode("utf-8", errors="replace"))),
         "exitCode": proc.returncode,
     }
+
+
+def _strip_clixml(text: str) -> str:
+    """Remove PowerShell CLIXML serialization from stderr output.
+
+    PowerShell serializes ErrorRecord objects to XML when stderr is redirected.
+    This strips the '#< CLIXML' header and the entire XML block that follows.
+    """
+    import re
+    # Match '#< CLIXML' followed by an XML block (Objs element)
+    pattern = re.compile(r'#<\s*CLIXML\s*<Objs[^>]*>.*?</Objs>', re.DOTALL | re.IGNORECASE)
+    cleaned = pattern.sub('', text)
+    # Also strip any remaining CLIXML header if XML parsing failed
+    cleaned = cleaned.replace('#< CLIXML', '').replace('#<CLIXML', '')
+    return cleaned.strip()
+
+
+def _normalize_crlf(text: str) -> str:
+    """Normalize CRLF to LF for consistent cross-platform text handling."""
+    return text.replace('\r\n', '\n') if '\r\n' in text else text
 
 
 async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
@@ -141,9 +165,17 @@ async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
     path = Path(params["path"])
     encoding = params.get("encoding")
 
+    if path.is_dir():
+        return {"error": f"Path is a directory: {path}"}
+    if not path.exists():
+        return {"error": f"File not found: {path}"}
+
     if encoding:
-        with open(path, "r", encoding=encoding) as f:
-            return {"content": f.read(), "encoding": encoding}
+        text = path.read_text(encoding=encoding)
+        # Normalize CRLF to LF for consistent cross-platform handling
+        if "\r\n" in text:
+            text = text.replace("\r\n", "\n")
+        return {"content": text, "encoding": encoding}
     else:
         with open(path, "rb") as f:
             return {"content": base64.b64encode(f.read()).decode(), "binary": True}
@@ -178,15 +210,123 @@ async def handle_file_list(params: dict[str, Any]) -> dict[str, Any]:
     path = Path(params["path"])
     entries = []
     for entry in path.iterdir():
-        stat = entry.stat()
-        entries.append({
-            "name": entry.name,
-            "isFile": entry.is_file(),
-            "isDir": entry.is_dir(),
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-        })
+        try:
+            stat = entry.stat()
+            entries.append({
+                "name": entry.name,
+                "isFile": entry.is_file(),
+                "isDir": entry.is_dir(),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            })
+        except (PermissionError, OSError):
+            entries.append({
+                "name": entry.name,
+                "isFile": False,
+                "isDir": False,
+                "size": 0,
+                "mtime": 0,
+                "error": "Permission denied",
+            })
     return {"entries": entries, "path": str(path)}
+
+
+async def handle_search_content(params: dict[str, Any]) -> dict[str, Any]:
+    """Search file contents using Python standard library (no rg/grep dependency).
+
+    Args:
+        pattern: Regex pattern to search for
+        path: Directory to search in (default: current directory)
+        file_glob: Optional glob pattern to filter files (e.g. '*.py')
+        limit: Maximum number of matches to return
+    """
+    import re
+    pattern_str = params["pattern"]
+    search_path = Path(params.get("path", "."))
+    file_glob = params.get("file_glob")
+    limit = params.get("limit", 50)
+
+    try:
+        regex = re.compile(pattern_str)
+    except re.error as e:
+        return {"error": f"Invalid regex pattern: {e}"}
+
+    matches = []
+    count = 0
+
+    if file_glob:
+        files = list(search_path.rglob(file_glob))
+    else:
+        files = [p for p in search_path.rglob("*") if p.is_file()]
+
+    for file_path in files:
+        if count >= limit:
+            break
+        try:
+            # Try UTF-8 first, then fall back to system encoding
+            try:
+                text = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = file_path.read_text(encoding="cp932")
+                except UnicodeDecodeError:
+                    continue  # Skip binary files
+
+            for line_num, line in enumerate(text.splitlines(), 1):
+                if regex.search(line):
+                    matches.append({
+                        "path": str(file_path),
+                        "line": line_num,
+                        "content": line.rstrip("\n\r").replace("\r\n", "\n"),
+                    })
+                    count += 1
+                    if count >= limit:
+                        break
+        except (PermissionError, OSError):
+            continue
+
+    return {"matches": matches, "total": count, "pattern": pattern_str, "path": str(search_path)}
+
+
+async def handle_search_files(params: dict[str, Any]) -> dict[str, Any]:
+    """Search files by name using Python standard library (no find/dir dependency).
+
+    Args:
+        pattern: Glob pattern to match filenames (e.g. '*.py', '*config*')
+        path: Directory to search in (default: current directory)
+        limit: Maximum number of results to return
+    """
+    search_path = Path(params.get("path", "."))
+    pattern = params["pattern"]
+    limit = params.get("limit", 50)
+
+    try:
+        files = list(search_path.rglob(pattern))
+    except (PermissionError, OSError) as e:
+        return {"error": f"Search failed: {e}"}
+
+    results = []
+    for file_path in files[:limit]:
+        try:
+            stat = file_path.stat()
+            results.append({
+                "path": str(file_path),
+                "isFile": file_path.is_file(),
+                "isDir": file_path.is_dir(),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            })
+        except (PermissionError, OSError):
+            results.append({
+                "path": str(file_path),
+                "isFile": False,
+                "isDir": False,
+                "size": 0,
+                "mtime": 0,
+                "error": "Permission denied",
+            })
+
+    return {"matches": results, "total": len(results), "pattern": pattern, "path": str(search_path)}
 
 
 async def handle_msbuild(params: dict[str, Any]) -> dict[str, Any]:
@@ -248,6 +388,8 @@ HANDLERS = {
     "file.write": handle_file_write,
     "file.delete": handle_file_delete,
     "file.list": handle_file_list,
+    "search.content": handle_search_content,
+    "search.files": handle_search_files,
     "msbuild": handle_msbuild,
     "signtool": handle_signtool,
 }

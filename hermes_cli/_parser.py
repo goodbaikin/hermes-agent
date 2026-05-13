@@ -324,6 +324,12 @@ def build_top_level_parser():
         metavar="N",
         help="Maximum tool-calling iterations per conversation turn (default: 90, or agent.max_turns in config)",
     )
+    chat_parser.add_argument(
+        "--workspace",
+        default=None,
+        metavar="NAME",
+        help="Active workspace for remote execution (defined in config.yaml workspaces section)",
+    )
     _inherited_flag(
         chat_parser,
         "--yolo",

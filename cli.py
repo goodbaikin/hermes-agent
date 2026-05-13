@@ -2139,6 +2139,7 @@ class HermesCLI:
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        workspace: str = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -2368,6 +2369,16 @@ class HermesCLI:
         self.conversation_history: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
         self._resumed = False
+        
+        # Workspace initialization
+        if workspace:
+            from agent.workspace_manager import get_workspace_manager
+            ws_manager = get_workspace_manager()
+            if ws_manager.set_active(workspace):
+                print(f"  Workspace: {workspace} → {ws_manager.get_active().node_id}")
+            else:
+                print(f"  Warning: workspace '{workspace}' not found, using default")
+        
         # Per-prompt elapsed timer — started at the beginning of each chat turn,
         # frozen when the agent thread completes, displayed in the status bar.
         self._prompt_start_time: Optional[float] = None  # time.time() when turn started
@@ -5125,6 +5136,42 @@ class HermesCLI:
         print(f"  Config File: {config_path} {config_status}")
         print()
     
+    def _handle_workspace_command(self, args: str):
+        """Switch active workspace or show current workspace info."""
+        from agent.workspace_manager import get_workspace_manager
+        
+        manager = get_workspace_manager()
+        
+        if not args.strip():
+            # Show current workspace and available workspaces
+            active = manager.get_active()
+            print()
+            print("  (^_^) Workspaces")
+            print()
+            print(f"  Active: {manager.active_name} → {active.node_id}")
+            if active.description:
+                print(f"  Description: {active.description}")
+            print(f"  Path prefixes: {', '.join(active.path_prefixes)}")
+            print()
+            print("  Available:")
+            for name in manager.list_workspaces():
+                ws = manager.get_workspace(name)
+                marker = " *" if name == manager.active_name else ""
+                print(f"    {name}: {ws.node_id}{marker}")
+            print()
+            return
+        
+        # Switch workspace
+        name = args.strip()
+        if manager.set_active(name):
+            active = manager.get_active()
+            print(f"  Switched to workspace '{name}' → {active.node_id}")
+            if active.description:
+                print(f"  {active.description}")
+        else:
+            print(f"  Workspace '{name}' not found.")
+            print(f"  Available: {', '.join(manager.list_workspaces())}")
+    
     def _list_recent_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
         """Return recent CLI sessions for in-chat browsing/resume affordances."""
         if not self._session_db:
@@ -6638,6 +6685,8 @@ class HermesCLI:
             self.show_toolsets()
         elif canonical == "config":
             self.show_config()
+        elif canonical == "workspace":
+            self._handle_workspace_command(args)
         elif canonical == "redraw":
             # Manual recovery for terminal buffer drift from multiplexer
             # tab switches, subshell ``clear``, SSH window restores, etc.
@@ -12303,6 +12352,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    workspace: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -12413,6 +12463,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        workspace=workspace,
     )
 
     if parsed_skills:

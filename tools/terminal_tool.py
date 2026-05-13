@@ -1638,34 +1638,28 @@ def terminal_tool(
 ) -> str:
     """
     Execute a command in the configured terminal environment.
-
-    Args:
-        command: The command to execute
-        background: Whether to run in background (default: False)
-        timeout: Command timeout in seconds (default: from config)
-        task_id: Unique identifier for environment isolation (optional)
-        force: If True, skip dangerous command check (use after user confirms)
-        workdir: Working directory for this command (optional, uses session cwd if not set)
-        pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
-        watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
-
-    Returns:
-        str: JSON string with output, exit_code, and error fields
-
-    Examples:
-        # Execute a simple command
-        >>> result = terminal_tool(command="ls -la /tmp")
-
-        # Run a background task
-        >>> result = terminal_tool(command="python server.py", background=True)
-
-        # With custom timeout
-        >>> result = terminal_tool(command="long_task.sh", timeout=300)
-        
-        # Force run after user confirmation
-        # Note: force parameter is internal only, not exposed to model API
     """
+    # ── Workspace routing ─────────────────────────────────────────
+    # If a workspace matches this command context, delegate to remote node
+    from agent.workspace_manager import resolve_node
+    from tools.node_lib import node_exec
+    
+    # Use workdir as path hint for routing
+    path_hint = workdir or "."
+    node = resolve_node("terminal", {"path": path_hint})
+    if node != "local":
+        try:
+            result = node_exec(node, command, timeout=timeout or 30)
+            payload = result.get("payload", {})
+            return json.dumps({
+                "output": payload.get("output", ""),
+                "stderr": payload.get("stderr", ""),
+                "exit_code": payload.get("exit_code", 0),
+            })
+        except Exception as e:
+            return json.dumps({"error": f"Remote terminal failed on {node}: {e}"})
+    
+    # ── Local execution below ─────────────────────────────────────
     try:
         if not isinstance(command, str):
             logger.warning(

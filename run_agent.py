@@ -970,6 +970,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        workspace: str = None,
     ):
         """
         Initialize the AI Agent.
@@ -1015,6 +1016,8 @@ class AIAgent:
             load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
                 identity even when skip_context_files=True. Project context files from the cwd
                 remain skipped.
+            workspace (str): Workspace directory or identifier for the agent session.
+                Used to set the working directory for tool execution (optional).
         """
         _install_safe_stdio()
 
@@ -1045,6 +1048,16 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
+        self.workspace = workspace
+        # Activate workspace if specified
+        if workspace:
+            try:
+                from agent.workspace_manager import get_workspace_manager
+                ws_mgr = get_workspace_manager()
+                if not ws_mgr.set_active(workspace):
+                    logger.warning("Workspace '%s' not found in config, using default", workspace)
+            except Exception as e:
+                logger.debug("Failed to activate workspace '%s': %s", workspace, e)
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
