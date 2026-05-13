@@ -2,7 +2,8 @@
 Workspace Router — Routes tool calls to remote nodes based on active workspace.
 
 In "replace" mode: ALL target tools are routed to the active workspace's node.
-The active workspace is the single source of truth — no path-based fallback.
+The active workspace is resolved from contextvars (per-agent) first, then falls
+back to the global WorkspaceManager for backward compatibility.
 
 Target tools: read_file, write_file, patch, search_files, terminal, execute_code
 """
@@ -39,6 +40,39 @@ def _get_workspace_mode() -> str:
     return "extend"
 
 
+def _resolve_workspace() -> Optional[str]:
+    """Resolve the effective workspace for the current tool call.
+    
+    Priority:
+    1. Context-local workspace (set by AIAgent.run_conversation via contextvars)
+    2. Global active workspace (WorkspaceManager singleton — backward compat)
+    """
+    try:
+        from agent.workspace_context import get_workspace
+        ctx_ws = get_workspace()
+        if ctx_ws:
+            return ctx_ws
+    except Exception:
+        pass
+    
+    # Fallback to global singleton for backward compatibility
+    try:
+        return get_workspace_manager().get_active().name
+    except Exception:
+        return None
+
+
+def _get_node_for_workspace(workspace_name: str) -> Optional[str]:
+    """Get the node_id for a given workspace name."""
+    try:
+        ws = get_workspace_manager().get_workspace(workspace_name)
+        if ws:
+            return ws.node_id
+    except Exception:
+        pass
+    return None
+
+
 def should_route_to_node(tool_name: str, _params: Optional[Dict] = None) -> Optional[str]:
     """
     In replace mode: if active workspace is non-default, route ALL workspace
@@ -50,11 +84,12 @@ def should_route_to_node(tool_name: str, _params: Optional[Dict] = None) -> Opti
     if _get_workspace_mode() != "replace":
         return None
 
-    active = get_workspace_manager().get_active()
-    if active.name == "default":
+    workspace = _resolve_workspace()
+    if not workspace or workspace == "default":
         return None
 
-    return active.node_id
+    node_id = _get_node_for_workspace(workspace)
+    return node_id
 
 
 def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Optional[str]:
@@ -178,14 +213,13 @@ def _route_execute_code(node_id: str, params: Dict[str, Any]) -> str:
 
 def get_routing_info(tool_name: str, _params: Optional[Dict] = None) -> Dict[str, Any]:
     """Return routing information for debugging."""
-    active = get_workspace_manager().get_active()
+    workspace = _resolve_workspace()
     node_id = should_route_to_node(tool_name)
 
     return {
         "tool": tool_name,
         "mode": _get_workspace_mode(),
-        "active_workspace": active.name,
-        "active_node": active.node_id,
+        "active_workspace": workspace or "default",
         "will_route": node_id is not None,
         "target_node": node_id,
     }

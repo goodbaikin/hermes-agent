@@ -1049,15 +1049,8 @@ class AIAgent:
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
         self.workspace = workspace
-        # Activate workspace if specified
-        if workspace:
-            try:
-                from agent.workspace_manager import get_workspace_manager
-                ws_mgr = get_workspace_manager()
-                if not ws_mgr.set_active(workspace):
-                    logger.warning("Workspace '%s' not found in config, using default", workspace)
-            except Exception as e:
-                logger.debug("Failed to activate workspace '%s': %s", workspace, e)
+        # Store workspace for context-scoped routing (do NOT set global active)
+        self._workspace = workspace
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1711,6 +1704,7 @@ class AIAgent:
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
         self._parent_session_id = parent_session_id
+        self._workspace = workspace
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         self._session_db_created = False  # DB row deferred to run_conversation()
         self._session_init_model_config = {
@@ -10848,6 +10842,11 @@ class AIAgent:
         # child-launch time see the parent's real id, not None.
         self._current_task_id = effective_task_id
         
+        # Set workspace context for this conversation turn so tool calls
+        # route to the correct node when workspace != "default".
+        from agent.workspace_context import set_workspace, reset_workspace
+        ws_token = set_workspace(self._workspace)
+        
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
         self._invalid_tool_retries = 0
@@ -10879,14 +10878,14 @@ class AIAgent:
                 pass
         # Replay compression warning through status_callback for gateway
         # platforms (the callback was not wired during __init__).
-        if self._compression_warning:
-            self._replay_compression_warning()
-            self._compression_warning = None  # send once
+            if self._compression_warning:
+                self._replay_compression_warning()
+                self._compression_warning = None  # send once
 
-        # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
-        # They are initialized in __init__ and must persist across run_conversation
-        # calls so that nudge logic accumulates correctly in CLI mode.
-        self.iteration_budget = IterationBudget(self.max_iterations)
+            # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
+            # They are initialized in __init__ and must persist across run_conversation
+            # calls so that nudge logic accumulates correctly in CLI mode.
+            self.iteration_budget = IterationBudget(self.max_iterations)
 
         # Log conversation turn start for debugging/observability
         _preview_text = _summarize_user_message_for_log(user_message)
@@ -14425,6 +14424,13 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
+
+        # Clear workspace context so it doesn't leak to other sessions
+        try:
+            from agent.workspace_context import reset_workspace
+            reset_workspace(ws_token)
+        except Exception:
+            pass
 
         return result
 

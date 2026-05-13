@@ -1639,26 +1639,6 @@ def terminal_tool(
     """
     Execute a command in the configured terminal environment.
     """
-    # ── Workspace routing ─────────────────────────────────────────
-    # If a workspace matches this command context, delegate to remote node
-    from agent.workspace_manager import resolve_node
-    from tools.node_lib import node_exec
-    
-    # Use workdir as path hint for routing
-    path_hint = workdir or "."
-    node = resolve_node("terminal", {"path": path_hint})
-    if node != "local":
-        try:
-            result = node_exec(node, command, timeout=timeout or 30)
-            payload = result.get("payload", {})
-            return json.dumps({
-                "output": payload.get("output", ""),
-                "stderr": payload.get("stderr", ""),
-                "exit_code": payload.get("exit_code", 0),
-            })
-        except Exception as e:
-            return json.dumps({"error": f"Remote terminal failed on {node}: {e}"})
-    
     # ── Local execution below ─────────────────────────────────────
     try:
         if not isinstance(command, str):
