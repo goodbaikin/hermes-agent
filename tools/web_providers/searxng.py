@@ -29,6 +29,26 @@ from tools.web_providers.base import WebSearchProvider
 logger = logging.getLogger(__name__)
 
 
+def _get_searxng_url() -> str:
+    """Resolve SearXNG URL from env or config.yaml."""
+    env_url = os.getenv("SEARXNG_URL", "").strip()
+    if env_url:
+        return env_url
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        url = cfg.get("SEARXNG_URL", "").strip()
+        if url:
+            return url
+        web_cfg = cfg.get("web", {})
+        url = web_cfg.get("searxng_url", "").strip()
+        if url:
+            return url
+    except Exception:
+        pass
+    return ""
+
+
 class SearXNGSearchProvider(WebSearchProvider):
     """Search via a SearXNG instance.
 
@@ -44,7 +64,7 @@ class SearXNGSearchProvider(WebSearchProvider):
 
     def is_configured(self) -> bool:
         """Return True when ``SEARXNG_URL`` is set to a non-empty value."""
-        return bool(os.getenv("SEARXNG_URL", "").strip())
+        return bool(_get_searxng_url())
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a search against the configured SearXNG instance.
@@ -70,7 +90,7 @@ class SearXNGSearchProvider(WebSearchProvider):
         """
         import httpx
 
-        base_url = os.getenv("SEARXNG_URL", "").strip().rstrip("/")
+        base_url = _get_searxng_url().rstrip("/")
         if not base_url:
             return {"success": False, "error": "SEARXNG_URL is not set"}
 

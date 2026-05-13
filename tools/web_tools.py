@@ -126,7 +126,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng", "crawl4ai"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -138,6 +138,7 @@ def _get_backend() -> str:
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("searxng", _has_env("SEARXNG_URL")),
+        ("crawl4ai", _has_env("CRAWL4AI_URL")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -196,6 +197,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("TAVILY_API_KEY")
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
+    if backend == "crawl4ai":
+        return _has_env("CRAWL4AI_URL")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -268,6 +271,8 @@ def _web_requires_env() -> list[str]:
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
+        "SEARXNG_URL",
+        "CRAWL4AI_URL",
     ]
     if managed_nous_tools_enabled():
         requires.extend(
@@ -1355,8 +1360,15 @@ async def web_extract_tool(
                 return json.dumps({
                     "success": False,
                     "error": "SearXNG is a search-only backend and cannot extract URL content. "
-                             "Set web.extract_backend to firecrawl, tavily, exa, or parallel.",
+                             "Set web.extract_backend to firecrawl, tavily, exa, parallel, or crawl4ai.",
                 }, ensure_ascii=False)
+            elif backend == "crawl4ai":
+                from tools.web_providers.crawl4ai import Crawl4AIExtractProvider
+                provider = Crawl4AIExtractProvider()
+                result = provider.extract(safe_urls, format=format)
+                if not result.get("success"):
+                    return json.dumps(result, ensure_ascii=False)
+                results = result["data"]
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
@@ -2035,9 +2047,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily", "searxng"):
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "searxng", "crawl4ai"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng"))
+    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "crawl4ai"))
 
 
 def check_auxiliary_model() -> bool:
