@@ -38,16 +38,23 @@ def node_read(node_id: str, path: str, offset: int = 1, limit: int = None) -> st
         import os
         path = os.path.expanduser(path)
     elif not path.startswith("/") and not path.startswith("C:"):
-        # Resolve relative path
+        # Resolve relative path using workspace config
         if node_id == "local":
             import os
             path = os.path.abspath(path)
         else:
-            # For remote Windows nodes, resolve relative to workspace dir
-            if node_id.startswith("dev-win") or node_id.startswith("win-"):
-                path = f"C:/Users/goodb/workspace/{path}"
+            from agent.workspace_manager import get_node_workdir
+            workdir = get_node_workdir(node_id)
+            if workdir:
+                # Ensure trailing slash for concatenation
+                prefix = workdir if workdir.endswith("/") else workdir + "/"
+                path = prefix + path
             else:
-                path = f"/home/node/workspace/{path}"
+                # Fallback for remote Windows nodes
+                if node_id.startswith("dev-win") or node_id.startswith("win-"):
+                    path = f"C:/Users/goodb/workspace/{path}"
+                else:
+                    path = f"/home/node/workspace/{path}"
     
     params = {"path": path, "encoding": "utf-8"}
     if offset is not None:
@@ -72,16 +79,21 @@ def node_write(node_id: str, path: str, content: str) -> Dict[str, Any]:
         import os
         path = os.path.expanduser(path)
     elif not path.startswith("/") and not path.startswith("C:"):
-        # Resolve relative path
+        # Resolve relative path using workspace config
         if node_id == "local":
             import os
             path = os.path.abspath(path)
         else:
-            # For remote Windows nodes, resolve relative to workspace dir
-            if node_id.startswith("dev-win") or node_id.startswith("win-"):
-                path = f"C:/Users/goodb/workspace/{path}"
+            from agent.workspace_manager import get_node_workdir
+            workdir = get_node_workdir(node_id)
+            if workdir:
+                prefix = workdir if workdir.endswith("/") else workdir + "/"
+                path = prefix + path
             else:
-                path = f"/home/node/workspace/{path}"
+                if node_id.startswith("dev-win") or node_id.startswith("win-"):
+                    path = f"C:/Users/goodb/workspace/{path}"
+                else:
+                    path = f"/home/node/workspace/{path}"
     
     content_b64 = base64.b64encode(content.encode("utf-8")).decode()
     result_str = node_invoke(node_id, "file.write", {
@@ -112,16 +124,16 @@ def node_patch(node_id: str, path: str, changes: List[Dict[str, Any]]) -> Dict[s
     return node_write(node_id, path, text)
 
 
-def node_exec(node_id: str, cmd: str, timeout: int = 30) -> Dict[str, Any]:
+def node_exec(node_id: str, cmd: str, timeout: int = 30, cwd: str = None) -> Dict[str, Any]:
     """Execute a command on a node."""
-    # On Windows nodes, prefix with UTF-8 encoding setup
-    # Detect if this is likely a Windows node by checking the command
-    # (node_invoke goes to the node client which runs on the target OS)
-    
-    result_str = node_invoke(node_id, "terminal.exec", {
+    params = {
         "cmd": cmd,
         "timeout": timeout,
-    })
+    }
+    if cwd:
+        params["cwd"] = cwd
+    
+    result_str = node_invoke(node_id, "terminal.exec", params)
     result = _parse_result(result_str)
     
     # Normalize payload: terminal.exec returns stdout/stderr/exitCode
@@ -153,12 +165,11 @@ def node_search(node_id: str, pattern: str, path: str = ".", file_glob: str = No
             import os
             path = os.path.abspath(path)
         else:
-            # For remote Windows nodes, resolve relative to workspace dir
-            # TODO: make this configurable per-node
-            if node_id.startswith("dev-win") or node_id.startswith("win-"):
-                path = f"C:/Users/goodb/workspace/{path}"
-            else:
-                path = f"/home/node/workspace/{path}"
+            from agent.workspace_manager import get_node_workdir
+            workdir = get_node_workdir(node_id)
+            if workdir:
+                prefix = workdir if workdir.endswith("/") else workdir + "/"
+                path = prefix + path
     
     if target == "files":
         result_str = node_invoke(node_id, "search.files", {
@@ -206,12 +217,12 @@ def node_find_files(node_id: str, pattern: str, path: str = ".", limit: int = 50
             import os
             path = os.path.abspath(path)
         else:
-            # For remote Windows nodes, resolve relative to workspace dir
-            if node_id.startswith("dev-win") or node_id.startswith("win-"):
-                path = f"C:/Users/goodb/workspace/{path}"
-            else:
-                path = f"/home/node/workspace/{path}"
-    
+            from agent.workspace_manager import get_node_workdir
+            workdir = get_node_workdir(node_id)
+            if workdir:
+                prefix = workdir if workdir.endswith("/") else workdir + "/"
+                path = prefix + path
+
     result_str = node_invoke(node_id, "search.files", {
         "pattern": pattern,
         "path": path,
