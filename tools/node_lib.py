@@ -336,6 +336,8 @@ try:
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
                     "path": {"type": "string", "description": "File path to read"},
+                    "offset": {"type": "integer", "description": "Line number to start from (1-based)", "default": 1},
+                    "limit": {"type": "integer", "description": "Maximum lines to return", "default": 500},
                 },
                 "required": ["node_id", "path"],
             },
@@ -343,6 +345,8 @@ try:
         handler=lambda args, **kw: node_read(
             node_id=args.get("node_id", ""),
             path=args.get("path", ""),
+            offset=args.get("offset", 1),
+            limit=args.get("limit"),
         ),
     )
     registry.register(
