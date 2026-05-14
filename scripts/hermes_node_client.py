@@ -98,21 +98,20 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
     # On Windows: use PowerShell with UTF-8 encoding, bypassing cmd.exe AutoRun
     # Skip wrapping if the command already invokes PowerShell/pwsh directly
     if sys.platform == "win32" and not cmd.strip().lower().startswith(("powershell", "pwsh")):
-        # Build PowerShell command as argument list to avoid shell escaping issues
-        # Use -EncodedCommand for complex commands to avoid quoting hell
-        # Set $ErrorView to NormalView to prevent CLIXML output in stderr
-        import base64
+        # Use -Command instead of -EncodedCommand to preserve stderr correctly.
+        # Escape double quotes in the user command so they survive the outer
+        # argument list passed to create_subprocess_exec.
+        escaped_cmd = cmd.replace('"', '\\"')
         ps_script = (
             '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
             '$OutputEncoding = [System.Text.Encoding]::UTF8; '
             '$ErrorView = \"NormalView\"; '
-            f'{cmd}'
+            f'{escaped_cmd}'
         )
-        encoded = base64.b64encode(ps_script.encode('utf-16le')).decode()
         args = [
             "powershell", "-NoProfile", "-NonInteractive",
             "-ExecutionPolicy", "Bypass",
-            "-EncodedCommand", encoded,
+            "-Command", ps_script,
         ]
     else:
         args = ["bash", "-c", cmd]
