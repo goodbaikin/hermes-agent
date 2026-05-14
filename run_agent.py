@@ -970,7 +970,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
-        workspace: str = None,
+        profile: str = None,
     ):
         """
         Initialize the AI Agent.
@@ -985,14 +985,14 @@ class AIAgent:
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
             disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
-            save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
-            verbose_logging (bool): Enable verbose logging for debugging (default: False)
-            quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
-            ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
-            log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 100)
-            log_prefix (str): Prefix to add to all log messages for identification in parallel processing (default: "")
-            providers_allowed (List[str]): OpenRouter providers to allow (optional)
-            providers_ignored (List[str]): OpenRouter providers to ignore (optional)
+            skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
+                into the system prompt. Use this for batch processing and data generation to avoid
+                polluting trajectories with user-specific persona or project instructions.
+            load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
+                identity even when skip_context_files=True. Project context files from the cwd
+                remain skipped.
+            profile (str): Profile name to use for workspace resolution.
+                The profile's active_workspace is used for tool execution routing (optional).
             providers_order (List[str]): OpenRouter providers to try in order (optional)
             provider_sort (str): Sort providers by price/throughput/latency (optional)
             session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
@@ -1016,8 +1016,6 @@ class AIAgent:
             load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
                 identity even when skip_context_files=True. Project context files from the cwd
                 remain skipped.
-            workspace (str): Workspace directory or identifier for the agent session.
-                Used to set the working directory for tool execution (optional).
         """
         _install_safe_stdio()
 
@@ -1048,9 +1046,20 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
-        self.workspace = workspace
-        # Store workspace for context-scoped routing (do NOT set global active)
-        self._workspace = workspace
+        self.profile = profile
+        self._workspace = None
+        if profile:
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                import yaml
+                profile_dir = get_profile_dir(profile)
+                config_path = profile_dir / "config.yaml"
+                if config_path.exists():
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        profile_config = yaml.safe_load(f) or {}
+                    self._workspace = profile_config.get("active_workspace")
+            except Exception:
+                pass
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1233,7 +1242,7 @@ class AIAgent:
         self._force_ascii_payload = False
         
         # Anthropic prompt caching: auto-enabled for Claude models on native
-        # Anthropic, OpenRouter, and third-party gateways that speak the
+        # Anthropic, OpeRouter, and third-party gateways that speak the
         # Anthropic protocol (``api_mode == 'anthropic_messages'``). Reduces
         # input costs by ~75% on multi-turn conversations. Uses system_and_3
         # strategy (4 breakpoints). See ``_anthropic_prompt_cache_policy``
@@ -1704,7 +1713,7 @@ class AIAgent:
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
         self._parent_session_id = parent_session_id
-        self._workspace = workspace
+        self._profile = profile
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         self._session_db_created = False  # DB row deferred to run_conversation()
         self._session_init_model_config = {

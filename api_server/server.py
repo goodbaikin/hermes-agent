@@ -402,7 +402,7 @@ class StandaloneAPIServer:
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
-        workspace: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -469,7 +469,7 @@ class StandaloneAPIServer:
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
-            workspace=workspace,
+            profile=profile,
         )
 
         if session_id:
@@ -481,10 +481,10 @@ class StandaloneAPIServer:
     # HTTP Handlers
     # ------------------------------------------------------------------
 
-    async def _handle_list_workspaces(self, request: "web.Request") -> "web.Response":
-        """GET /api/workspaces -- list configured workspaces."""
-        from api_server.handlers.workspaces import handle_list_workspaces
-        return await handle_list_workspaces(request, check_auth=self._check_auth)
+    async def _handle_list_profiles(self, request: "web.Request") -> "web.Response":
+        """GET /api/profiles -- list all profiles."""
+        from api_server.handlers.profiles import handle_list_profiles
+        return await handle_list_profiles(request, check_auth=self._check_auth)
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health -- simple health check."""
@@ -1172,7 +1172,7 @@ class StandaloneAPIServer:
             self._app.router.add_get("/api/config", self._handle_get_config)
             self._app.router.add_patch("/api/config", self._handle_update_config)
             self._app.router.add_get("/api/available-models", self._handle_available_models)
-            self._app.router.add_get("/api/workspaces", self._handle_list_workspaces)
+            self._app.router.add_get("/api/profiles", self._handle_list_profiles)
 
             # Refuse to start network-accessible without authentication
             if is_network_accessible(self._host) and not self._api_key:

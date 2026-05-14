@@ -116,3 +116,71 @@ def get_active_workspace() -> Workspace:
 def resolve_node(tool_name: str, params: Optional[Dict] = None) -> str:
     """Convenience function: resolve node for a tool call."""
     return get_workspace_manager().resolve_node(tool_name, params)
+
+
+def get_workspace_for_node(node_id: str) -> Optional[Workspace]:
+    """Find a workspace by its node_id. Returns the first match or None."""
+    try:
+        wm = get_workspace_manager()
+        for name in wm.list_workspaces():
+            ws = wm.get_workspace(name)
+            if ws and ws.node_id == node_id:
+                return ws
+    except Exception:
+        pass
+    return None
+
+
+def get_node_workdir(node_id: str) -> Optional[str]:
+    """Get the default working directory for a node from its workspace config."""
+    ws = get_workspace_for_node(node_id)
+    if ws and ws.path_prefixes:
+        return ws.path_prefixes[0]
+    return None
+
+
+def get_profile_default_workspace() -> Optional[str]:
+    """Read active_workspace from the current profile's config.yaml.
+
+    Returns the workspace name configured for this profile, or None if
+    not set (caller should fall back to 'default').
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        import yaml
+        import os
+
+        config_path = os.path.join(get_hermes_home(), "config.yaml")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            return config.get("active_workspace")
+    except Exception:
+        pass
+    return None
+
+
+def save_active_workspace(workspace_name: str) -> bool:
+    """Persist active_workspace to the current profile's config.yaml.
+
+    Updates the config file so the workspace sticks across restarts.
+    Returns True on success.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        import yaml
+        import os
+
+        config_path = os.path.join(get_hermes_home(), "config.yaml")
+        config = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+
+        config["active_workspace"] = workspace_name
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        return True
+    except Exception:
+        return False

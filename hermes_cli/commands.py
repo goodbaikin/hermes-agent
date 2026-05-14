@@ -112,8 +112,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("workspace", "Switch active workspace for remote execution", "Configuration",
-               args_hint="[name]", aliases=("ws",)),
     CommandDef("model", "Switch model for this session", "Configuration",
                aliases=("provider",), args_hint="[model] [--provider name] [--global]"),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",

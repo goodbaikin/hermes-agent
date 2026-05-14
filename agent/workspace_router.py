@@ -62,6 +62,16 @@ def _resolve_workspace() -> Optional[str]:
         return None
 
 
+def _get_workspace_workdir() -> Optional[str]:
+    """Get the default working directory from the active workspace's path_prefixes."""
+    ws_name = _resolve_workspace()
+    if ws_name:
+        ws = get_workspace_manager().get_workspace(ws_name)
+        if ws and ws.path_prefixes:
+            return ws.path_prefixes[0]
+    return None
+
+
 def _get_node_for_workspace(workspace_name: str) -> Optional[str]:
     """Get the node_id for a given workspace name."""
     try:
@@ -152,10 +162,9 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
 
         elif tool_name == "terminal":
             cmd = params.get("command", "")
-            workdir = params.get("workdir")
-            if workdir:
-                cmd = f"cd {workdir}; {cmd}"
-            result = node_lib.node_exec(node_id, cmd, timeout=params.get("timeout", 180))
+            # Pass cwd to node client so it runs in the correct directory
+            workdir = params.get("workdir") or _get_workspace_workdir()
+            result = node_lib.node_exec(node_id, cmd, timeout=params.get("timeout", 180), cwd=workdir)
             payload = result.get("payload", {})
             return json.dumps({
                 "output": payload.get("output", ""),

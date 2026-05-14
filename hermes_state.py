@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
-    workspace TEXT,
+    profile TEXT,
     api_call_count INTEGER DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
@@ -525,13 +525,13 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
-        workspace: str = None,
+        profile: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, workspace, started_at)
+                   system_prompt, parent_session_id, profile, started_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
@@ -541,7 +541,7 @@ class SessionDB:
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
-                    workspace,
+                    profile,
                     time.time(),
                 ),
             )
