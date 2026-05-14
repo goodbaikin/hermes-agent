@@ -201,7 +201,7 @@ def _route_execute_code(node_id: str, params: Dict[str, Any]) -> str:
     is_windows = node_id.startswith("dev-win") or node_id.startswith("win-")
     if is_windows:
         temp_name = f"C:/Users/goodb/workspace/.hermes_tmp_{uuid.uuid4().hex[:8]}.py"
-        py_cmd = f"python {temp_name}"
+        py_cmd = f"python -X utf8 {temp_name}"
         rm_cmd = f"Remove-Item -Path '{temp_name}' -Force -ErrorAction SilentlyContinue"
     else:
         temp_name = f"/tmp/hermes_workspace_{uuid.uuid4().hex[:8]}.py"
