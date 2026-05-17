@@ -142,34 +142,39 @@ async def handle_chat_completions(
         _stream_q: _q.Queue = _q.Queue()
 
         def _on_delta(delta):
-            if delta is not None:
+            if delta is not None and delta != "":
                 _stream_q.put(delta)
 
         _started_tool_call_ids: set[str] = set()
 
-        def _on_tool_start(tool_call_id, function_name, function_args):
-            if not tool_call_id or function_name.startswith("_"):
-                return
-            _started_tool_call_ids.add(tool_call_id)
-            from agent.display import build_tool_preview, get_tool_emoji
-            label = build_tool_preview(function_name, function_args) or function_name
-            _stream_q.put(("__tool_progress__", {
-                "tool": function_name,
-                "emoji": get_tool_emoji(function_name),
-                "label": label,
-                "toolCallId": tool_call_id,
-                "status": "running",
-            }))
+        def _on_tool_progress(event_type, name, preview, args, **kwargs):
+            if event_type == "tool.started":
+                tool_call_id = kwargs.get("tool_call_id", "")
+                if not tool_call_id or name.startswith("_"):
+                    return
+                _started_tool_call_ids.add(tool_call_id)
+                from agent.display import build_tool_preview, get_tool_emoji
+                label = build_tool_preview(name, args) or name
+                _stream_q.put(("__tool_progress__", {
+                    "tool": name,
+                    "emoji": get_tool_emoji(name),
+                    "label": label,
+                    "toolCallId": tool_call_id,
+                    "status": "running",
+                }))
+            elif event_type == "tool.completed":
+                tool_call_id = kwargs.get("tool_call_id", "")
+                if not tool_call_id or tool_call_id not in _started_tool_call_ids:
+                    return
+                _started_tool_call_ids.discard(tool_call_id)
+                _stream_q.put(("__tool_progress__", {
+                    "tool": name,
+                    "toolCallId": tool_call_id,
+                    "status": "completed",
+                }))
 
-        def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-            if not tool_call_id or tool_call_id not in _started_tool_call_ids:
-                return
-            _started_tool_call_ids.discard(tool_call_id)
-            _stream_q.put(("__tool_progress__", {
-                "tool": function_name,
-                "toolCallId": tool_call_id,
-                "status": "completed",
-            }))
+        def _on_tool_start(tool_call_id, function_name, function_args):
+            pass  # handled by _on_tool_progress
 
         agent_ref = [None]
         agent_task = asyncio.ensure_future(adapter._run_agent(
@@ -178,8 +183,8 @@ async def handle_chat_completions(
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             stream_delta_callback=_on_delta,
+            tool_progress_callback=_on_tool_progress,
             tool_start_callback=_on_tool_start,
-            tool_complete_callback=_on_tool_complete,
             agent_ref=agent_ref,
         ))
 

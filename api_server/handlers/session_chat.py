@@ -188,7 +188,7 @@ async def handle_session_chat_stream(
     run_id = f"run_{uuid.uuid4().hex}"
 
     def _on_delta(delta):
-        if delta:
+        if delta and delta != "":
             _queue_event(
                 "assistant.delta",
                 {"session_id": session_id, "run_id": run_id, "message_id": assistant_message_id, "delta": delta},
@@ -213,11 +213,14 @@ async def handle_session_chat_stream(
         tool_call_id = kwargs.get("tool_call_id", "")
         if event_type == "tool.started":
             logger.info("[_on_tool_progress] tool.started name=%s tool_call_id=%s", name, tool_call_id)
+            from agent.display import build_tool_preview
+            preview = build_tool_preview(name, args) or name
             payload = {
                 "session_id": session_id,
                 "run_id": run_id,
                 "tool_call_id": tool_call_id,
                 "tool_name": name,
+                "preview": preview,
                 "args": args,
             }
             _queue_event("tool.started", payload)

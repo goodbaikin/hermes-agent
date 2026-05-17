@@ -136,7 +136,7 @@ async def handle_responses(
         _stream_q: _q.Queue = _q.Queue()
 
         def _on_delta(delta):
-            if delta is not None:
+            if delta is not None and delta != "":
                 _stream_q.put(delta)
 
         def _on_tool_progress(event_type, name, preview, args, **kwargs):
@@ -155,19 +155,10 @@ async def handle_responses(
                 }))
 
         def _on_tool_start(tool_call_id, function_name, function_args):
-            _stream_q.put(("__tool_started__", {
-                "tool_call_id": tool_call_id,
-                "name": function_name,
-                "arguments": function_args or {},
-            }))
+            pass  # handled by _on_tool_progress
 
         def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-            _stream_q.put(("__tool_completed__", {
-                "tool_call_id": tool_call_id,
-                "name": function_name,
-                "arguments": function_args or {},
-                "result": function_result,
-            }))
+            pass  # handled by _on_tool_progress
 
         agent_ref = [None]
         agent_task = asyncio.ensure_future(adapter._run_agent(
