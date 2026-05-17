@@ -486,6 +486,11 @@ class StandaloneAPIServer:
         from api_server.handlers.profiles import handle_list_profiles
         return await handle_list_profiles(request, check_auth=self._check_auth)
 
+    async def _handle_get_profile_config(self, request: "web.Request") -> "web.Response":
+        """GET /api/profiles/{name} -- get profile config."""
+        from api_server.handlers.profiles import handle_get_profile_config
+        return await handle_get_profile_config(request, check_auth=self._check_auth)
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health -- simple health check."""
         from api_server.handlers.health import handle_health
@@ -1173,6 +1178,7 @@ class StandaloneAPIServer:
             self._app.router.add_patch("/api/config", self._handle_update_config)
             self._app.router.add_get("/api/available-models", self._handle_available_models)
             self._app.router.add_get("/api/profiles", self._handle_list_profiles)
+            self._app.router.add_get("/api/profiles/{name}", self._handle_get_profile_config)
 
             # Refuse to start network-accessible without authentication
             if is_network_accessible(self._host) and not self._api_key:

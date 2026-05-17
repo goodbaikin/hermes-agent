@@ -140,7 +140,19 @@ async def handle_responses(
                 _stream_q.put(delta)
 
         def _on_tool_progress(event_type, name, preview, args, **kwargs):
-            return
+            if event_type == "tool.started":
+                _stream_q.put(("__tool_started__", {
+                    "tool_call_id": kwargs.get("tool_call_id", ""),
+                    "name": name,
+                    "arguments": args or {},
+                }))
+            elif event_type == "tool.completed":
+                _stream_q.put(("__tool_completed__", {
+                    "tool_call_id": kwargs.get("tool_call_id", ""),
+                    "name": name,
+                    "arguments": args or {},
+                    "result_preview": preview,
+                }))
 
         def _on_tool_start(tool_call_id, function_name, function_args):
             _stream_q.put(("__tool_started__", {

@@ -211,18 +211,37 @@ async def handle_session_chat_stream(
             )
             return
         tool_call_id = kwargs.get("tool_call_id", "")
-        logger.info(f"[_on_tool_progress] tool.started name={name} tool_call_id={tool_call_id}")
-        payload = {
-            "session_id": session_id,
-            "run_id": run_id,
-            "tool_name": name,
-            "preview": preview,
-            "args": args,
-            "tool_call_id": tool_call_id,
-        }
-        _queue_event("tool.started", payload)
-        # Also send tool.progress for progress updates
-        _queue_event("tool.progress", payload)
+        if event_type == "tool.started":
+            logger.info("[_on_tool_progress] tool.started name=%s tool_call_id=%s", name, tool_call_id)
+            payload = {
+                "session_id": session_id,
+                "run_id": run_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": name,
+                "args": args,
+            }
+            _queue_event("tool.started", payload)
+        elif event_type == "tool.completed":
+            logger.info("[_on_tool_progress] tool.completed name=%s tool_call_id=%s", name, tool_call_id)
+            payload = {
+                "session_id": session_id,
+                "run_id": run_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": name,
+                "result_preview": preview,
+                "is_error": kwargs.get("is_error", False),
+            }
+            _queue_event("tool.completed", payload)
+        elif event_type == "tool.progress":
+            payload = {
+                "session_id": session_id,
+                "run_id": run_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": name,
+                "preview": preview,
+                "args": args,
+            }
+            _queue_event("tool.progress", payload)
 
     agent_ref = [None]
     loop = asyncio.get_event_loop()
@@ -230,7 +249,7 @@ async def handle_session_chat_stream(
     def _make_tool_complete_callback(run_id, loop):
         """Return a tool_complete_callback that pushes tool.completed events to the SSE queue."""
         def _callback(tool_call_id, tool_name, args, function_result):
-            logger.info(f"[TOOL COMPLETE CALLBACK] tool_call_id={tool_call_id} tool_name={tool_name}")
+            logger.info("[TOOL COMPLETE CALLBACK] tool_call_id=%s tool_name=%s", tool_call_id, tool_name)
             try:
                 result_preview = ""
                 is_error = False
