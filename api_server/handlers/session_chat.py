@@ -225,16 +225,9 @@ async def handle_session_chat_stream(
             }
             _queue_event("tool.started", payload)
         elif event_type == "tool.completed":
-            logger.info("[_on_tool_progress] tool.completed name=%s tool_call_id=%s", name, tool_call_id)
-            payload = {
-                "session_id": session_id,
-                "run_id": run_id,
-                "tool_call_id": tool_call_id,
-                "tool_name": name,
-                "result_preview": preview,
-                "is_error": kwargs.get("is_error", False),
-            }
-            _queue_event("tool.completed", payload)
+            # tool.completed is handled by _make_tool_complete_callback for consistent
+            # tool_call_id and result_preview. Skip here to avoid double-fire.
+            pass
         elif event_type == "tool.progress":
             payload = {
                 "session_id": session_id,
@@ -367,8 +360,14 @@ async def handle_session_chat_stream(
 
         try:
             result = await agent_task
-        except Exception:
+        except Exception as e:
+            logger.error("[session_chat] Agent task failed: %s", e)
             result = {"messages": [], "final_response": "", "completed": False}
+            # Signal SSE loop to terminate
+            try:
+                stream_q.put(None)
+            except Exception:
+                pass
 
         # Auto-generate session title after first exchange (synchronous — HTTP request/response)
         try:
@@ -461,5 +460,11 @@ async def handle_session_chat_stream(
             except (asyncio.CancelledError, Exception):
                 pass
         logger.info("Session SSE client disconnected; interrupted session %s", session_id)
+
+    # Ensure response is fully closed for clean SSE termination
+    try:
+        await response.write_eof()
+    except Exception:
+        pass
 
     return response
