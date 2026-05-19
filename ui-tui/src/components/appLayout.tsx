@@ -16,6 +16,7 @@ import {
   stableComposerColumns
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
+import { composerPromptText } from '../lib/prompt.js'
 
 import { AgentsOverlay } from './agentsOverlay.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
@@ -76,6 +77,15 @@ const TranscriptPane = memo(function TranscriptPane({
     return -1
   }, [transcript.historyItems])
 
+  // Index of the first user-role message; every later user message gets a
+  // small dash above it so multi-turn transcripts visually segment by
+  // turn. -1 when no user message has been sent yet → no separator ever
+  // renders.
+  const firstUserIdx = useMemo(
+    () => transcript.historyItems.findIndex(m => m.role === 'user'),
+    [transcript.historyItems]
+  )
+
   return (
     <>
       <ScrollBox
@@ -95,6 +105,12 @@ const TranscriptPane = memo(function TranscriptPane({
 
           {transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end).map(row => (
             <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
+              {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
+                <Box marginTop={1}>
+                  <Text color={ui.theme.color.border}>───</Text>
+                </Box>
+              )}
+
               {row.msg.kind === 'intro' ? (
                 <Box flexDirection="column" paddingTop={1}>
                   <Banner t={ui.theme} />
@@ -155,7 +171,7 @@ const ComposerPane = memo(function ComposerPane({
   const ui = useStore($uiState)
   const isBlocked = useStore($isBlocked)
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
-  const promptText = sh ? '$' : ui.theme.brand.prompt
+  const promptText = composerPromptText(ui.theme.brand.prompt, ui.info?.profile_name, sh)
   const promptWidth = composerPromptWidth(promptText)
   const promptBlank = ' '.repeat(promptWidth)
   const inputColumns = stableComposerColumns(composer.cols, promptWidth)

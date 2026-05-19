@@ -100,18 +100,19 @@ class _VikingClient:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
 
     def _headers(self) -> dict:
-        # Only send tenant headers when the user actually configured them.
-        # Legacy installs had account/user defaulted to the literal string
-        # "default" — treat that as unset so authenticated remote servers
-        # that derive tenancy from the Bearer key aren't overridden by a
-        # bogus tenant value.
+        # Always send tenant headers when account/user are configured.
+        # OpenViking 0.3.x requires X-OpenViking-Account and X-OpenViking-User
+        # for ROOT API key requests to tenant-scoped APIs — omitting them
+        # causes INVALID_ARGUMENT errors even when account="default".
+        # User-level keys can omit them (server derives tenancy from the key),
+        # but ROOT keys must always include them explicitly.
         h = {
             "Content-Type": "application/json",
             "X-OpenViking-Agent": self._agent,
         }
-        if self._account and self._account != "default":
+        if self._account:
             h["X-OpenViking-Account"] = self._account
-        if self._user and self._user != "default":
+        if self._user:
             h["X-OpenViking-User"] = self._user
         if self._api_key:
             h["X-API-Key"] = self._api_key
@@ -335,10 +336,17 @@ ADD_RESOURCE_SCHEMA = {
 
 def _zip_directory(dir_path: Path) -> Path:
     """Create a temporary zip file containing a directory tree."""
+    root = dir_path.resolve()
     zip_path = Path(tempfile.gettempdir()) / f"openviking_upload_{uuid.uuid4().hex}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for file_path in dir_path.rglob("*"):
+            if file_path.is_symlink():
+                continue
             if file_path.is_file():
+                try:
+                    file_path.resolve().relative_to(root)
+                except ValueError:
+                    continue
                 arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
                 zipf.write(file_path, arcname=arcname)
     return zip_path
@@ -349,7 +357,7 @@ def _is_windows_absolute_path(value: str) -> bool:
         len(value) >= 3
         and value[0].isalpha()
         and value[1] == ":"
-        and value[2] in ("/", "\\")
+        and value[2] in {"/", "\\"}
     )
 
 
@@ -373,7 +381,7 @@ def _is_local_path_reference(value: str) -> bool:
 
 def _path_from_file_uri(uri: str) -> Path | str:
     parsed = urlparse(uri)
-    if parsed.netloc not in ("", "localhost"):
+    if parsed.netloc not in {"", "localhost"}:
         return f"Unsupported non-local file URI: {uri}"
     return Path(url2pathname(parsed.path)).expanduser()
 
@@ -747,7 +755,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         level = args.get("level", "overview")
 
-        summary_level = level in ("abstract", "overview")
+        summary_level = level in {"abstract", "overview"}
         # OpenViking expects directory URIs for pseudo summary files
         # (e.g. viking://user/hermes/.overview.md).
         resolved_uri = self._normalize_summary_uri(uri) if summary_level else uri
@@ -824,7 +832,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         result = self._unwrap_result(resp)
 
         # Format list/tree results for readability
-        if action in ("list", "tree"):
+        if action in {"list", "tree"}:
             raw_entries = result
             if isinstance(result, dict):
                 raw_entries = result.get("entries") or result.get("items") or result.get("children") or []
@@ -879,7 +887,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         payload: Dict[str, Any] = {}
         for key in ("reason", "to", "parent", "instruction", "wait", "timeout"):
-            if key in args and args[key] not in (None, ""):
+            if key in args and args[key] not in {None, ""}:
                 payload[key] = args[key]
 
         parsed_url = urlparse(url)
