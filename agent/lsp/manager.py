@@ -61,6 +61,9 @@ from agent.lsp.workspace import (
     resolve_workspace_for_file,
 )
 
+# Remote LSP support — delegates to node_client LSP RPC servers
+from agent.lsp.remote_client import RemoteLSPClient, format_diagnostics
+
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
@@ -175,6 +178,10 @@ class LSPService:
         if self._enabled:
             self._loop.start()
 
+        # Remote LSP clients keyed by node_id
+        self._remote_clients: Dict[str, RemoteLSPClient] = {}
+        self._remote_lock = threading.Lock()
+
         # Per-(server_id, workspace_root) state
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
@@ -262,9 +269,23 @@ class LSPService:
         layer skips the LSP path entirely — no spawn attempts, no
         timeout cost — until the service is restarted (``hermes lsp
         restart``) or the process exits.
+
+        For remote files (paths starting with a node prefix like
+        ``dev-win01:/path``), always returns True if a server matches
+        the extension and the node has a RemoteLSPClient configured.
         """
         if not self._enabled:
             return False
+
+        # Check for remote file paths (node_id:/path format)
+        if ":/" in file_path or "\\" in file_path:
+            # Windows-style path on remote node — check if we have a remote client
+            srv = find_server_for_file(file_path)
+            if srv is None or srv.server_id in self._disabled_servers:
+                return False
+            # For remote files, we don't gate on git worktree
+            return True
+
         srv = find_server_for_file(file_path)
         if srv is None or srv.server_id in self._disabled_servers:
             return False
@@ -343,6 +364,23 @@ class LSPService:
         # when the request errors out below.
         srv = find_server_for_file(file_path)
         server_id = srv.server_id if srv else "?"
+
+        # Check for remote file paths (node_id:/path or Windows paths)
+        # For remote files, delegate to RemoteLSPClient
+        if ":/" in file_path or (len(file_path) > 2 and file_path[1] == ":"):
+            # Extract node_id from the path or use a configured mapping
+            node_id = self._resolve_node_for_file(file_path)
+            if node_id:
+                try:
+                    diags = self._get_remote_diagnostics(node_id, file_path, srv)
+                    if diags:
+                        eventlog.log_diagnostics(server_id, file_path, len(diags))
+                    else:
+                        eventlog.log_clean(server_id, file_path)
+                    return diags
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Remote LSP diagnostics failed for %s: %s", file_path, e)
+                    return []
 
         try:
             t = timeout if timeout is not None else self._wait_timeout + 2.0
@@ -446,6 +484,78 @@ class LSPService:
             logger.debug("LSP shutdown error: %s", e)
         self._loop.stop()
         clear_cache()
+
+    # ------------------------------------------------------------------
+    # Remote LSP helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_node_for_file(self, file_path: str) -> Optional[str]:
+        """Resolve which node_id should handle a remote file path.
+
+        For now, uses a simple heuristic:
+        - Windows paths (C:\\...) are assumed to be on dev-win01
+        - Paths with node_id: prefix extract the node_id
+        """
+        # Windows absolute path
+        if len(file_path) > 2 and file_path[1] == ":":
+            return "dev-win01"
+        # node_id:/path format
+        if ":/" in file_path:
+            node_id, _ = file_path.split(":/", 1)
+            return node_id
+        return None
+
+    def _get_remote_client(self, node_id: str) -> RemoteLSPClient:
+        """Get or create a RemoteLSPClient for the given node."""
+        with self._remote_lock:
+            client = self._remote_clients.get(node_id)
+            if client is None:
+                client = RemoteLSPClient(node_id)
+                self._remote_clients[node_id] = client
+            return client
+
+    def _get_remote_diagnostics(
+        self,
+        node_id: str,
+        file_path: str,
+        srv: Optional[Any],
+    ) -> List[Dict[str, Any]]:
+        """Get diagnostics from a remote LSP server.
+
+        This is a synchronous wrapper around the async RemoteLSPClient.
+        """
+        client = self._get_remote_client(node_id)
+        language = language_id_for(file_path) if srv else "plaintext"
+
+        # For remote files, we need the file content
+        # Try to read it via node_exec
+        content = self._read_remote_file(node_id, file_path)
+
+        # Use the background loop to run the async call
+        coro = client.lint_after_write(
+            file_path=file_path,
+            content=content or "",
+            language=language,
+        )
+        return self._loop.run(coro, timeout=self._wait_timeout + 5.0) or []
+
+    def _read_remote_file(self, node_id: str, file_path: str) -> str:
+        """Read a remote file's content via node_exec."""
+        try:
+            # Import here to avoid circular imports
+            from tools.node_invoke import node_exec
+
+            result = asyncio.run(node_exec(node_id, {
+                "tool": "file",
+                "action": "read",
+                "path": file_path,
+            }))
+            if isinstance(result, dict) and "content" in result:
+                return result["content"]
+            return ""
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Failed to read remote file %s: %s", file_path, e)
+            return ""
 
     # ------------------------------------------------------------------
     # async internals

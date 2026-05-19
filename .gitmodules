@@ -1,0 +1,3 @@
+[submodule "node_client"]
+	path = node_client
+	url = https://github.com/goodbaikin/hermes-node-client.git
