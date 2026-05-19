@@ -80,7 +80,9 @@ async def handle_session_chat(
         return result, usage
 
     try:
-        result, usage = await loop.run_in_executor(None, _run)
+        import contextvars
+        ctx = contextvars.copy_context()
+        result, usage = await loop.run_in_executor(None, ctx.run, _run)
     except Exception as e:
         logger.error("Error running session chat for %s: %s", session_id, e, exc_info=True)
         return web.json_response({"error": str(e)}, status=500)
@@ -290,7 +292,9 @@ async def handle_session_chat_stream(
                 persist_user_message=persist_text,
             )
 
-        return await loop.run_in_executor(None, _run)
+        import contextvars
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, ctx.run, _run)
 
     agent_task = asyncio.ensure_future(_run_agent_task())
 

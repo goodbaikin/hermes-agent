@@ -137,6 +137,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    profile: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -1026,13 +1027,19 @@ def init_agent(
                     if agent._gateway_session_key:
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key
                     # Profile identity for per-profile provider scoping
-                    try:
-                        from hermes_cli.profiles import get_active_profile_name
-                        _profile = get_active_profile_name()
+                    # Prefer the explicitly-passed profile (e.g. from WebUI/API
+                    # server) over the CLI active profile so gateway requests
+                    # are scoped to the correct workspace.
+                    _profile = profile
+                    if not _profile:
+                        try:
+                            from hermes_cli.profiles import get_active_profile_name
+                            _profile = get_active_profile_name()
+                        except Exception:
+                            pass
+                    if _profile:
                         _init_kwargs["agent_identity"] = _profile
                         _init_kwargs["agent_workspace"] = "hermes"
-                    except Exception:
-                        pass
                     agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
@@ -1498,6 +1505,35 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+
+    # Activate workspace from profile if provided
+    # Store on agent for per-session isolation via contextvars in run_conversation.
+    # Do NOT touch the global WorkspaceManager singleton here — concurrent
+    # sessions (API Server) would clobber each other's active workspace.
+    agent._workspace = None
+    if profile:
+        try:
+            # Load profile-specific config to get active_workspace
+            from hermes_cli.profiles import get_profile_dir
+            profile_dir = get_profile_dir(profile)
+            if profile_dir:
+                import yaml
+                config_path = profile_dir / "config.yaml"
+                if config_path.exists():
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        profile_config = yaml.safe_load(f) or {}
+                    active_ws = profile_config.get("active_workspace")
+                    if active_ws:
+                        agent._workspace = active_ws
+                        _ra().logger.info("Workspace '%s' resolved from profile '%s'", active_ws, profile)
+                    else:
+                        _ra().logger.debug("No active_workspace in profile '%s' config", profile)
+                else:
+                    _ra().logger.debug("No config.yaml found for profile '%s'", profile)
+            else:
+                _ra().logger.warning("Profile directory not found for '%s'", profile)
+        except Exception as e:
+            _ra().logger.debug("Failed to resolve workspace from profile '%s': %s", profile, e)
 
 
 

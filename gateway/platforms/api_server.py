@@ -857,6 +857,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -890,6 +891,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # If profile not explicitly provided, try to resolve from session DB
+        if profile is None and session_id:
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    session = db.get_session(session_id)
+                    if session:
+                        profile = session.get("profile")
+            except Exception:
+                pass
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -908,6 +920,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            profile=profile,
         )
         return agent
 

@@ -451,6 +451,17 @@ class StandaloneAPIServer:
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # If profile not explicitly provided, try to resolve from session DB
+        if profile is None and session_id:
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    session = db.get_session(session_id)
+                    if session:
+                        profile = session.get("profile")
+            except Exception:
+                pass
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,

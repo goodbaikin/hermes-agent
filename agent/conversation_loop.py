@@ -237,14 +237,30 @@ def run_conversation(
     from hermes_logging import set_session_context
     set_session_context(agent.session_id)
 
-    # Bind the skill write-origin ContextVar for this thread so tool
-    # handlers (e.g. skill_manage create) can tell whether they are
-    # running inside the background agent-improvement review fork vs.
-    # a foreground user-directed turn. Set at the top of each call;
-    # the review fork runs on its own thread with a fresh context,
-    # so the foreground value here does not leak into it.
-    from tools.skill_provenance import set_current_write_origin
-    set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    # Set per-session workspace context for tool routing isolation.
+    # WorkspaceManager is a global singleton; contextvars give each
+    # agent session its own routing scope so concurrent sessions don't
+    # clobber each other's workspace.
+    _workspace_token = None
+    try:
+        from agent.workspace_context import set_workspace
+        _agent_workspace = getattr(agent, "_workspace", None)
+        if _agent_workspace:
+            _workspace_token = set_workspace(_agent_workspace)
+    except Exception:
+        pass
+
+    try:
+        # Bind the skill write-origin ContextVar for this thread so tool
+        # handlers (e.g. skill_manage create) can tell whether they are
+        # running inside the background agent-improvement review fork vs.
+        # a foreground user-directed turn. Set at the top of each call;
+        # the review fork runs on its own thread with a fresh context,
+        # so the foreground value here does not leak into it.
+        from tools.skill_provenance import set_current_write_origin
+        set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    except Exception:
+        pass
 
     # If the previous turn activated fallback, restore the primary
     # runtime so this turn gets a fresh attempt with the preferred model.
@@ -4091,6 +4107,14 @@ def run_conversation(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    # Clear workspace context so it doesn't leak to other sessions
+    if _workspace_token is not None:
+        try:
+            from agent.workspace_context import reset_workspace
+            reset_workspace(_workspace_token)
+        except Exception:
+            pass
 
     return result
 
