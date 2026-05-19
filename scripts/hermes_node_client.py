@@ -36,6 +36,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -44,11 +45,6 @@ from pathlib import Path
 from typing import Any
 
 import websockets
-
-# PTY imports (Unix only)
-if sys.platform != "win32":
-    import errno
-    import select
 
 # ---------------------------------------------------------------------------
 # Logging setup (Windows Event Log friendly)
@@ -136,12 +132,12 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
             f'{escaped_cmd}'
         )
         args = [
-            "powershell", "-NoProfile", "-NonInteractive",
+            _resolve_command("powershell"), "-NoProfile", "-NonInteractive",
             "-ExecutionPolicy", "Bypass",
             "-Command", ps_script,
         ]
     else:
-        args = ["bash", "-c", cmd]
+        args = [_resolve_command("bash"), "-c", cmd]
 
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -186,6 +182,82 @@ def _strip_clixml(text: str) -> str:
 def _normalize_crlf(text: str) -> str:
     """Normalize CRLF to LF for consistent cross-platform text handling."""
     return text.replace('\r\n', '\n') if '\r\n' in text else text
+
+
+def _resolve_command(name: str) -> str:
+    """Resolve a command name to an absolute path via shutil.which().
+
+    On Windows, commands like ``powershell`` may not be on PATH in some
+    configurations (e.g. restricted shells, custom installs).  Using
+    ``shutil.which()`` returns the fully-qualified path when found,
+    which is more robust than relying on bare-name resolution.
+
+    Falls back to the bare name if not found on PATH — the subsequent
+    Popen will raise FileNotFoundError with a readable error.
+    """
+    resolved = shutil.which(name)
+    return resolved if resolved else name
+
+
+def _pid_exists(pid: int) -> bool:
+    """Cross-platform "is this PID alive" check that does NOT kill the target.
+
+    CRITICAL on Windows: Python's ``os.kill(pid, 0)`` is NOT a no-op like it
+    is on POSIX. CPython's Windows implementation treats ``sig=0`` as
+    ``CTRL_C_EVENT`` and routes it through ``GenerateConsoleCtrlEvent(0, pid)``
+    — which sends a Ctrl+C to the entire console process group containing the
+    target PID, not just the PID itself.  Any caller that wanted to "check if
+    this PID is alive" via ``os.kill(pid, 0)`` on Windows was silently killing
+    that process (and often unrelated processes).  Long-standing Python quirk;
+    see bpo-14484.
+
+    Fix: use the Win32 ``OpenProcess`` / ``WaitForSingleObject`` pair on
+    Windows to check existence without any signal path; use the POSIX
+    ``os.kill(pid, 0)`` idiom on POSIX where it actually is a no-op.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            # Pin return types — default ctypes restype is c_int (signed),
+            # which mangles WAIT_* DWORD return codes into negative numbers.
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint
+            kernel32.GetLastError.restype = ctypes.c_uint
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            SYNCHRONIZE = 0x100000  # required for WaitForSingleObject
+            WAIT_TIMEOUT = 0x00000102
+            ERROR_INVALID_PARAMETER = 87
+            ERROR_ACCESS_DENIED = 5
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid)
+            )
+            if not handle:
+                err = kernel32.GetLastError()
+                if err == ERROR_INVALID_PARAMETER:
+                    return False  # PID definitely gone
+                if err == ERROR_ACCESS_DENIED:
+                    return True   # Exists but owned by another user/session
+                return False      # Conservative default for unknown errors
+            try:
+                wait_result = kernel32.WaitForSingleObject(handle, 0)
+                # WAIT_TIMEOUT = still running; anything else = gone.
+                return wait_result == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(handle)
+        except (OSError, AttributeError):
+            return False
+    else:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process exists but we can't signal it — still alive.
+            return True
+        except OSError:
+            return False
 
 
 async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
@@ -489,7 +561,11 @@ async def handle_node_restart(params: dict[str, Any]) -> dict[str, Any]:
     if sys.platform == "win32":
         subprocess.Popen(
             args,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NO_WINDOW
+            ),
             close_fds=True,
         )
     else:
@@ -579,7 +655,6 @@ async def _terminal_open(proxy_id: str, params: dict[str, Any]) -> dict[str, Any
 
     cols = params.get("cols", 80)
     rows = params.get("rows", 24)
-    initial_cwd = params.get("cwd")
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -618,9 +693,9 @@ async def _terminal_open(proxy_id: str, params: dict[str, Any]) -> dict[str, Any
             env["INPUTRC"] = "/dev/null"
 
             # Use asyncio subprocess with PTY (avoids fork issues in event loop)
-            # -i = interactive shell; INPUTRC=/dev/null prevents readline from resetting termios
+            # --norc = don't read .bashrc, -i = interactive; INPUTRC=/dev/null prevents readline from resetting termios
             proc = await asyncio.create_subprocess_exec(
-                shell, "-i",
+                shell, "--norc", "-i",
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
@@ -634,6 +709,7 @@ async def _terminal_open(proxy_id: str, params: dict[str, Any]) -> dict[str, Any
             # Re-apply termios settings to the child's controlling terminal
             # (bash resets them on startup)
             try:
+                import time
                 time.sleep(0.1)  # Wait for child to start
                 # Get slave PTY name from master_fd
                 try:
@@ -681,40 +757,7 @@ async def _terminal_open(proxy_id: str, params: dict[str, Any]) -> dict[str, Any
             logger.info("[%s] Terminal session %s opened (PTY, shell=%s)", NODE_ID, proxy_id, shell)
             return {"ok": True, "proxyId": proxy_id}
 
-        # Windows PTY mode using pywinpty (ConPTY)
-        if sys.platform == "win32":
-            try:
-                from winpty import PTY
-
-                # PowerShell works best with -NoExit to keep the session alive
-                # Use -WorkingDirectory to set the initial cwd (more reliable than pty.spawn cwd)
-                appname = shell
-                cmdline_args = "-NoExit"
-                if initial_cwd:
-                    cmdline_args += f' -WorkingDirectory "{initial_cwd}"'
-                cmdline_args += ' -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8"'
-
-                pty = PTY(cols, rows)
-                pty.spawn(appname, cmdline=cmdline_args)
-
-                logger.info("[%s] WinPTY session %s opened (shell=%s, cwd=%s)", NODE_ID, proxy_id, shell, initial_cwd)
-                TERMINAL_SESSIONS[proxy_id] = {
-                    "pty": True,
-                    "winpty": pty,
-                    "cols": cols,
-                    "rows": rows,
-                    "shell": shell,
-                    "last_activity": time.time(),
-                    "reader_task": None,
-                }
-                _ensure_cleanup_task()
-                return {"ok": True, "proxyId": proxy_id}
-            except ImportError:
-                logger.warning("[%s] pywinpty not installed, falling back to pipe mode", NODE_ID)
-            except Exception as e:
-                logger.warning("[%s] WinPTY init failed: %s, falling back to pipe mode", NODE_ID, e)
-
-        # Fallback: regular subprocess (Windows without pywinpty, or non-shell commands)
+        # Fallback: regular subprocess (Windows or non-shell commands)
         proc = await asyncio.create_subprocess_exec(
             shell,
             stdin=asyncio.subprocess.PIPE,
@@ -752,20 +795,14 @@ async def _terminal_write(proxy_id: str, params: dict[str, Any]) -> dict[str, An
     except Exception:
         data = data_b64  # fallback: treat as plain text
 
-    session["last_activity"] = time.time()
-
-    # Windows PTY mode (pywinpty)
-    winpty = session.get("winpty")
-    if winpty is not None:
-        try:
-            winpty.write(data)
-            return {"ok": True}
-        except Exception as e:
-            return {"ok": False, "error": f"Write failed: {e}"}
+    # Convert CR to LF for PTY compatibility
+    # Also handle CRLF -> LF to avoid double newlines
+    data = data.replace("\r\n", "\n").replace("\r", "\n")
 
     proc = session["proc"]
     master_fd = session.get("master_fd")
     logger.info("[%s] _terminal_write: proxy_id=%s master_fd=%s data_len=%d", NODE_ID, proxy_id, master_fd, len(data))
+    session["last_activity"] = time.time()
     if master_fd is not None:
         # PTY mode: write directly to master_fd
         try:
@@ -788,33 +825,11 @@ async def _terminal_resize(proxy_id: str, params: dict[str, Any]) -> dict[str, A
     if not session:
         return {"ok": False, "error": "Terminal session not found"}
 
-    cols = params.get("cols", 80)
-    rows = params.get("rows", 24)
-    session["cols"] = cols
-    session["rows"] = rows
+    session["cols"] = params.get("cols", 80)
+    session["rows"] = params.get("rows", 24)
 
-    # Windows PTY mode (pywinpty)
-    winpty = session.get("winpty")
-    if winpty is not None:
-        try:
-            winpty.set_size(cols, rows)
-            return {"ok": True}
-        except Exception as e:
-            logger.debug("[%s] WinPTY resize failed: %s", NODE_ID, e)
-            return {"ok": True}  # best effort
-
-    # On Unix PTY, resizing requires termios
-    master_fd = session.get("master_fd")
-    if master_fd is not None and sys.platform != "win32":
-        try:
-            import struct
-            import termios
-            import fcntl
-            size = struct.pack("HHHH", rows, cols, 0, 0)
-            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, size)
-        except Exception:
-            pass
-
+    # On Windows, resizing requires pywinpty or similar
+    # For now, just record the size; the shell may handle SIGWINCH on Unix
     return {"ok": True}
 
 
@@ -829,10 +844,9 @@ async def _terminal_close(proxy_id: str) -> dict[str, Any]:
     if not session:
         return {"ok": True}  # Already closed
 
-    proc = session.get("proc")
+    proc = session["proc"]
     master_fd = session.get("master_fd")
     reader_task = session.get("reader_task")
-    winpty = session.get("winpty")
 
     # Cancel reader task first and wait for it to finish
     if reader_task is not None:
@@ -844,14 +858,6 @@ async def _terminal_close(proxy_id: str) -> dict[str, Any]:
         except Exception as e:
             logger.debug("[%s] Error cancelling reader task for %s: %s", NODE_ID, proxy_id, e)
 
-    # Close Windows PTY
-    if winpty is not None:
-        try:
-            winpty.close()
-            logger.info("[%s] Terminal session %s WinPTY closed", NODE_ID, proxy_id)
-        except Exception as e:
-            logger.debug("[%s] Error closing WinPTY for %s: %s", NODE_ID, proxy_id, e)
-
     # Close master_fd after reader task has exited
     if master_fd is not None:
         try:
@@ -861,7 +867,7 @@ async def _terminal_close(proxy_id: str) -> dict[str, Any]:
             logger.debug("[%s] Error closing master_fd for %s: %s", NODE_ID, proxy_id, e)
 
     try:
-        if proc and proc.returncode is None:
+        if proc.returncode is None:
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
@@ -937,63 +943,69 @@ async def _read_terminal_output_pty(
     master_fd: int,
     proc: asyncio.subprocess.Process,
 ) -> None:
-    """Background task: read PTY master_fd output and send to gateway.
-    
-    Uses asyncio.add_reader() for efficient non-blocking I/O instead of
-    executor polling which can leak threads.
-    """
+    """Background task: read PTY master_fd output and send to gateway."""
+    loop = asyncio.get_event_loop()
     logger.info("[%s] PTY reader started for proxy_id=%s master_fd=%d", NODE_ID, proxy_id, master_fd)
-    
-    # Make master_fd non-blocking
-    import fcntl
-    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    
+    check_count = 0
     try:
         while True:
-            # Check if process has exited
-            if proc.returncode is not None:
-                logger.info("[%s] PTY reader: process exited, breaking", NODE_ID)
-                break
-            
-            # Read from non-blocking fd
             try:
-                data = os.read(master_fd, 4096)
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    # No data available, wait a bit and retry
-                    await asyncio.sleep(0.05)
-                    continue
-                if exc.errno in (errno.EIO, errno.EBADF):
-                    logger.info("[%s] PTY reader: EOF/error", NODE_ID)
+                # Check if process has exited
+                if proc.returncode is not None:
+                    logger.info("[%s] PTY reader: process exited, breaking", NODE_ID)
                     break
-                raise
-            
-            if not data:
-                logger.info("[%s] PTY reader: EOF", NODE_ID)
-                break
-            
-            logger.info("[%s] PTY reader: read %d bytes", NODE_ID, len(data))
-            
-            try:
-                session = TERMINAL_SESSIONS.get(proxy_id)
-                if session:
-                    session["last_activity"] = time.time()
-                await ws.send(json.dumps({
-                    "type": "event",
-                    "event": "node.terminal.output",
-                    "payload": {
-                        "proxyId": proxy_id,
-                        "data": base64.b64encode(data).decode("ascii"),
-                    },
-                }))
-                logger.info("[%s] PTY reader: sent %d bytes to gateway", NODE_ID, len(data))
-            except Exception as exc:
-                logger.warning("[%s] Terminal output send failed: %s", NODE_ID, exc)
+                # Read from master_fd with timeout to avoid blocking forever
+                data = await asyncio.wait_for(
+                    loop.run_in_executor(None, os.read, master_fd, 4096),
+                    timeout=0.5,
+                )
+                if not data:
+                    logger.info("[%s] PTY reader: EOF", NODE_ID)
+                    break
+                logger.info("[%s] PTY reader: read %d bytes", NODE_ID, len(data))
+                # Periodically re-apply termios settings (bash/readline may reset them)
+                check_count += 1
+                if check_count % 2 == 0:  # Check every 2 reads (was 10)
+                    try:
+                        pts_name = os.ptsname(master_fd)
+                        pts_fd = os.open(pts_name, os.O_RDWR | os.O_NOCTTY)
+                        try:
+                            attrs = termios.tcgetattr(pts_fd)
+                            if not (attrs[3] & termios.ECHO):
+                                attrs[3] |= termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
+                                attrs[0] |= termios.ICRNL
+                                attrs[1] |= termios.OPOST | termios.ONLCR
+                                termios.tcsetattr(pts_fd, termios.TCSANOW, attrs)
+                                logger.info("[%s] PTY watchdog: re-enabled echo on %s", NODE_ID, pts_name)
+                        finally:
+                            os.close(pts_fd)
+                    except Exception:
+                        pass
+                try:
+                    session = TERMINAL_SESSIONS.get(proxy_id)
+                    if session:
+                        session["last_activity"] = time.time()
+                    await ws.send(json.dumps({
+                        "type": "event",
+                        "event": "node.terminal.output",
+                        "payload": {
+                            "proxyId": proxy_id,
+                            "data": base64.b64encode(data).decode("ascii"),
+                        },
+                    }))
+                    logger.info("[%s] PTY reader: sent %d bytes to gateway", NODE_ID, len(data))
+                except Exception as exc:
+                    logger.warning("[%s] Terminal output send failed: %s", NODE_ID, exc)
+                    break
+            except asyncio.TimeoutError:
+                # No output available, loop back and check process status
+                continue
+            except OSError as exc:
+                logger.warning("[%s] PTY reader OSError: %s", NODE_ID, exc)
                 break
     except Exception as exc:
         logger.warning("[%s] PTY reader error: %s", NODE_ID, exc)
-    
+
     # Process exited — notify gateway
     try:
         await ws.send(json.dumps({
@@ -1003,71 +1015,8 @@ async def _read_terminal_output_pty(
         }))
     except Exception:
         pass
-    
+
     # Clean up session (do NOT close master_fd here — _terminal_close handles it)
-    TERMINAL_SESSIONS.pop(proxy_id, None)
-
-
-async def _read_terminal_output_winpty(
-    ws: websockets.WebSocketClientProtocol,
-    proxy_id: str,
-    winpty: Any,
-) -> None:
-    """Background task: read Windows PTY output and send to gateway.
-
-    pywinpty PTY.read() is synchronous, so we run it in an executor.
-    """
-    logger.info("[%s] WinPTY reader started for proxy_id=%s", NODE_ID, proxy_id)
-    loop = asyncio.get_running_loop()
-
-    try:
-        while True:
-            session = TERMINAL_SESSIONS.get(proxy_id)
-            if not session or session.get("winpty") is None:
-                logger.info("[%s] WinPTY reader: session closed, breaking", NODE_ID)
-                break
-
-            try:
-                # PTY.read() blocks until data is available; use executor
-                # pywinpty 3.x: read(blocking=False) returns str, no length param
-                data = await loop.run_in_executor(None, lambda: winpty.read(blocking=True))
-            except Exception as exc:
-                logger.info("[%s] WinPTY reader: read error %s", NODE_ID, exc)
-                break
-
-            if not data:
-                await asyncio.sleep(0.05)
-                continue
-
-            try:
-                if session:
-                    session["last_activity"] = time.time()
-                await ws.send(json.dumps({
-                    "type": "event",
-                    "event": "node.terminal.output",
-                    "payload": {
-                        "proxyId": proxy_id,
-                        "data": base64.b64encode(data.encode("utf-8", errors="replace")).decode("ascii"),
-                    },
-                }))
-                logger.info("[%s] WinPTY reader: sent %d bytes to gateway", NODE_ID, len(data))
-            except Exception as exc:
-                logger.warning("[%s] WinPTY reader: send failed: %s", NODE_ID, exc)
-                break
-    except Exception as exc:
-        logger.warning("[%s] WinPTY reader error: %s", NODE_ID, exc)
-
-    # Notify gateway
-    try:
-        await ws.send(json.dumps({
-            "type": "event",
-            "event": "node.terminal.close",
-            "payload": {"proxyId": proxy_id},
-        }))
-    except Exception:
-        pass
-
-    # Clean up session
     TERMINAL_SESSIONS.pop(proxy_id, None)
 
 
@@ -1087,10 +1036,7 @@ async def handle_terminal_data(ws: websockets.WebSocketClientProtocol, payload: 
             # Start background output reader
             session = TERMINAL_SESSIONS.get(proxy_id)
             if session:
-                if session.get("winpty") is not None:
-                    task = asyncio.create_task(_read_terminal_output_winpty(ws, proxy_id, session["winpty"]))
-                    session["reader_task"] = task
-                elif session.get("pty") and session.get("master_fd") is not None:
+                if session.get("pty") and session.get("master_fd") is not None:
                     task = asyncio.create_task(_read_terminal_output_pty(ws, proxy_id, session["master_fd"], session["proc"]))
                     session["reader_task"] = task
                 else:
@@ -1156,14 +1102,7 @@ async def handle_invoke(ws: websockets.WebSocketClientProtocol, payload: dict[st
             proxy_id = params.get("proxyId")
             session = TERMINAL_SESSIONS.get(proxy_id)
             if session and proxy_id:
-                if session.get("winpty") is not None:
-                    task = asyncio.create_task(_read_terminal_output_winpty(ws, proxy_id, session["winpty"]))
-                    session["reader_task"] = task
-                elif session.get("pty") and session.get("master_fd") is not None:
-                    task = asyncio.create_task(_read_terminal_output_pty(ws, proxy_id, session["master_fd"], session["proc"]))
-                    session["reader_task"] = task
-                else:
-                    asyncio.create_task(_read_terminal_output(ws, proxy_id, session["proc"]))
+                asyncio.create_task(_read_terminal_output(ws, proxy_id, session["proc"]))
 
         await send_result(ws, request_id, True, result)
     except Exception as e:
