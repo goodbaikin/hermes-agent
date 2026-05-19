@@ -1,6 +1,7 @@
 """WebSocket handlers for the API Server."""
 
 import asyncio
+import hmac
 import json
 import logging
 from typing import Any, Dict
@@ -12,7 +13,7 @@ from api_server.node_registry import NODE_REGISTRY, NodeSession
 logger = logging.getLogger(__name__)
 
 
-async def handle_ws_real(request: web.Request) -> web.WebSocketResponse:
+async def handle_ws_real(request: web.Request, api_key: str = "") -> web.WebSocketResponse:
     """
     WebSocket endpoint for remote node connections.
 
@@ -21,12 +22,35 @@ async def handle_ws_real(request: web.Request) -> web.WebSocketResponse:
     2. Gateway responds {type:"res", ok:true, payload:{type:"hello-ok", ...}}
     3. Gateway sends {type:"event", event:"node.invoke.request", payload:{...}}
     4. Node responds {type:"event", event:"node.invoke.result", payload:{...}}
+
+    Authentication:
+    - Query param: ?token=xxx
+    - Or Authorization header: Bearer xxx
+    - Or connect message auth.token (legacy fallback)
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
     node_session = None
     node_id = None
+
+    # --- Auth check ---
+    auth_ok = False
+    if api_key:
+        # Check query param ?token=xxx
+        query_token = request.query.get("token", "")
+        if query_token and hmac.compare_digest(query_token, api_key):
+            auth_ok = True
+        else:
+            # Check Authorization header
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                header_token = auth_header[7:].strip()
+                if hmac.compare_digest(header_token, api_key):
+                    auth_ok = True
+    else:
+        # No API key configured — allow all (local development only)
+        auth_ok = True
 
     try:
         async for msg in ws:
@@ -51,6 +75,22 @@ async def handle_ws_real(request: web.Request) -> web.WebSocketResponse:
                         "id": data.get("id"),
                         "ok": False,
                         "error": {"message": "Only 'node' role is supported on /ws"},
+                    }))
+                    await ws.close()
+                    return ws
+
+                # If not yet authenticated, check connect message auth.token
+                if not auth_ok and api_key:
+                    connect_token = params.get("auth", {}).get("token", "")
+                    if connect_token and hmac.compare_digest(connect_token, api_key):
+                        auth_ok = True
+
+                if not auth_ok:
+                    await ws.send_str(json.dumps({
+                        "type": "res",
+                        "id": data.get("id"),
+                        "ok": False,
+                        "error": {"message": "Authentication failed", "code": "auth_failed"},
                     }))
                     await ws.close()
                     return ws
@@ -97,6 +137,33 @@ async def handle_ws_real(request: web.Request) -> web.WebSocketResponse:
                 result_payload = payload.get("payload")
                 error = payload.get("error")
                 NODE_REGISTRY.handle_result(request_id, ok, result_payload, error)
+                continue
+
+            # --- Terminal output from node ---
+            if msg_type == "event" and event == "node.terminal.output":
+                payload = data.get("payload", {})
+                proxy_id = payload.get("proxyId")
+                data_b64 = payload.get("data")
+                if proxy_id and data_b64:
+                    from api_server.handlers.terminal_proxy import TERMINAL_PROXY_MANAGER
+                    await TERMINAL_PROXY_MANAGER.handle_node_output(proxy_id, data_b64)
+                continue
+
+            if msg_type == "event" and event == "node.terminal.close":
+                payload = data.get("payload", {})
+                proxy_id = payload.get("proxyId")
+                if proxy_id:
+                    from api_server.handlers.terminal_proxy import TERMINAL_PROXY_MANAGER
+                    await TERMINAL_PROXY_MANAGER.handle_node_close(proxy_id)
+                continue
+
+            if msg_type == "event" and event == "node.terminal.error":
+                payload = data.get("payload", {})
+                proxy_id = payload.get("proxyId")
+                error = payload.get("error", "Unknown terminal error")
+                if proxy_id:
+                    from api_server.handlers.terminal_proxy import TERMINAL_PROXY_MANAGER
+                    await TERMINAL_PROXY_MANAGER.handle_node_error(proxy_id, error)
                 continue
 
     except Exception as exc:

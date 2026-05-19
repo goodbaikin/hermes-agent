@@ -1145,6 +1145,10 @@ class StandaloneAPIServer:
             self._app.router.add_post("/v1/nodes/{node_id}/invoke", self._handle_node_invoke)
             # Remote node WebSocket (OpenClaw-style gateway-node protocol)
             self._app.router.add_get("/ws", self._handle_ws)
+            # Node registration WebSocket (node_client connects here)
+            self._app.router.add_get("/ws/node", self._handle_ws_node)
+            # Terminal WebSocket proxy (browser <-> node)
+            self._app.router.add_get("/ws/nodes/{node_id}/terminal", self._handle_terminal_ws)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
@@ -1284,7 +1288,17 @@ class StandaloneAPIServer:
     async def _handle_ws(self, request: "web.Request") -> "web.WebSocketResponse":
         """GET /ws -- WebSocket endpoint for remote node protocol (OpenClaw-style)."""
         from api_server.handlers.ws import handle_ws_real
-        return await handle_ws_real(request)
+        return await handle_ws_real(request, api_key=self._api_key)
+
+    async def _handle_terminal_ws(self, request: "web.Request") -> "web.WebSocketResponse":
+        """GET /ws/nodes/{node_id}/terminal -- WebSocket terminal proxy."""
+        from api_server.handlers.terminal_proxy import handle_terminal_ws
+        return await handle_terminal_ws(request, check_auth=self._check_auth, api_key=self._api_key)
+
+    async def _handle_ws_node(self, request: "web.Request") -> "web.WebSocketResponse":
+        """GET /ws/node -- WebSocket endpoint for node_client registration."""
+        from api_server.handlers.ws_node import handle_ws_node
+        return await handle_ws_node(request, api_key=self._api_key)
 
     # ------------------------------------------------------------------
     # Node HTTP API handlers

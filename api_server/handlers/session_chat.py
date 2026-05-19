@@ -278,7 +278,7 @@ async def handle_session_chat_stream(
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
-                tool_start_callback=_on_tool_start,
+                tool_start_callback=None,  # tool.started is handled by tool_progress_callback to avoid double-fire
                 tool_complete_callback=_make_tool_complete_callback(run_id, loop),
                 profile=session.get("profile"),
             )
