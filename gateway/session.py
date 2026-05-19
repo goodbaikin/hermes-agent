@@ -90,6 +90,7 @@ class SessionSource:
     is_bot: bool = False  # True when the message author is a bot/webhook (Discord)
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
+    profile: Optional[str] = None  # Hermes profile name for workspace/skill routing
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
     
     @property
@@ -132,6 +133,8 @@ class SessionSource:
             d["guild_id"] = self.guild_id
         if self.parent_chat_id:
             d["parent_chat_id"] = self.parent_chat_id
+        if self.profile:
+            d["profile"] = self.profile
         if self.message_id:
             d["message_id"] = self.message_id
         return d
@@ -151,6 +154,7 @@ class SessionSource:
             chat_id_alt=data.get("chat_id_alt"),
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
+            profile=data.get("profile"),
             message_id=data.get("message_id"),
         )
     
@@ -937,6 +941,7 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "profile": source.profile,
             }
 
         # SQLite operations outside the lock
