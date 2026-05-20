@@ -138,6 +138,29 @@ class _ComponentFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
+class _ToolErrorFilter(logging.Filter):
+    """Suppress routine tool-call errors from ``errors.log``.
+
+    Tool execution failures (e.g. ``execute_code`` returning a non-zero
+    exit code, ``terminal`` hitting a network timeout) are logged at
+    WARNING by ``agent.tool_executor``.  These are expected during
+    normal operation and clutter the error triage log.  This filter
+    drops them while leaving genuine infrastructure warnings intact.
+    """
+
+    _TOOL_ERROR_RE = re.compile(
+        r"Tool\s+\w+\s+returned\s+error",
+        re.IGNORECASE,
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "agent.tool_executor" and record.levelno == logging.WARNING:
+            msg = record.getMessage()
+            if self._TOOL_ERROR_RE.search(msg):
+                return False
+        return True
+
+
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
@@ -231,6 +254,7 @@ def setup_logging(
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
         formatter=RedactingFormatter(_LOG_FORMAT),
+        log_filter=_ToolErrorFilter(),
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
