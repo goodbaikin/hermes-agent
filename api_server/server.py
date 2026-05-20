@@ -563,6 +563,24 @@ class StandaloneAPIServer:
             ensure_session_db=self._ensure_session_db,
         )
 
+    async def _handle_session_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/status -- session state for cross-device sync."""
+        from api_server.handlers.sessions import handle_session_status
+        return await handle_session_status(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
+
+    async def _handle_session_messages_diff(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/messages/diff -- differential message sync."""
+        from api_server.handlers.sessions import handle_session_messages_diff
+        return await handle_session_messages_diff(
+            request,
+            check_auth=self._check_auth,
+            ensure_session_db=self._ensure_session_db,
+        )
+
     async def _handle_update_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} -- update a session."""
         from api_server.handlers.sessions import handle_update_session
@@ -1160,6 +1178,8 @@ class StandaloneAPIServer:
             self._app.router.add_get("/ws/node", self._handle_ws_node)
             # Terminal WebSocket proxy (browser <-> node)
             self._app.router.add_get("/ws/nodes/{node_id}/terminal", self._handle_terminal_ws)
+            # Browser streaming WebSocket (unified SSE management)
+            self._app.router.add_get("/ws/stream/{session_id}", self._handle_ws_stream)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
@@ -1173,11 +1193,17 @@ class StandaloneAPIServer:
                 pass
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
+
+            # Start ConnectionManager cleanup for idle sessions
+            from api_server.connection_manager import CONNECTION_MANAGER
+            asyncio.create_task(CONNECTION_MANAGER.start_cleanup())
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
             self._app.router.add_get("/api/sessions/search", self._handle_search_sessions)
             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_get_session_messages)
+            self._app.router.add_get("/api/sessions/{session_id}/status", self._handle_session_status)
+            self._app.router.add_get("/api/sessions/{session_id}/messages/diff", self._handle_session_messages_diff)
             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_update_session)
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
@@ -1258,6 +1284,12 @@ class StandaloneAPIServer:
     async def disconnect(self) -> None:
         """Stop the aiohttp web server."""
         self._running = False
+        # Stop ConnectionManager cleanup
+        try:
+            from api_server.connection_manager import CONNECTION_MANAGER
+            await CONNECTION_MANAGER.stop_cleanup()
+        except Exception:
+            pass
         if self._site:
             await self._site.stop()
             self._site = None
@@ -1310,6 +1342,26 @@ class StandaloneAPIServer:
         """GET /ws/node -- WebSocket endpoint for node_client registration."""
         from api_server.handlers.ws_node import handle_ws_node
         return await handle_ws_node(request, api_key=self._api_key)
+
+    async def _handle_ws_stream(self, request: "web.Request") -> "web.WebSocketResponse":
+        """GET /ws/stream/{session_id} -- WebSocket endpoint for browser streaming.
+
+        Unified WebSocket + SSE management:
+          - Browser connects here (multiple browsers per session OK)
+          - ConnectionManager maintains one upstream SSE context per session
+          - Events are buffered and replayed on reconnect (since=offset)
+          - Browser disconnect does NOT kill the upstream SSE
+        """
+        from api_server.connection_manager import CONNECTION_MANAGER
+        session_id = request.match_info["session_id"]
+        return await CONNECTION_MANAGER.handle_browser_ws(
+            request,
+            session_id,
+            create_agent_fn=self._create_agent,
+            get_session_db_fn=self._get_session_db,
+            build_user_content_fn=self._build_user_content,
+            cors_headers_for_origin_fn=self._cors_headers_for_origin,
+        )
 
     # ------------------------------------------------------------------
     # Node HTTP API handlers
