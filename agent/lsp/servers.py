@@ -622,6 +622,34 @@ def _spawn_jdtls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
+def _spawn_csharp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+    """Spawn roslyn-language-server for C#.
+
+    On Windows (remote node), the actual binary is resolved by the
+    node_client's lsp_server.py.  Here we just return a marker spec
+    so that ``find_server_for_file`` matches .cs files and the
+    remote LSP path in LSPService can delegate to the node.
+    """
+    # For remote C# files, we don't try to spawn locally — the
+    # LSPService._get_remote_diagnostics path handles it.
+    # Return a minimal spec so the server registry recognizes C#.
+    return SpawnSpec(
+        command=["roslyn-language-server", "--stdio", "--autoLoadProjects"],
+        workspace_root=root,
+        cwd=root,
+        env=ctx.env_overrides.get("roslyn", {}),
+        initialization_options=ctx.init_overrides.get("roslyn", {}),
+    )
+
+
+def _root_csharp(file_path: str, workspace: str) -> Optional[str]:
+    return _root_or_workspace(
+        file_path,
+        workspace,
+        [".sln", ".csproj"],
+    )
+
+
 def _spawn_vue(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "vue-language-server") or _which(
         "vue-language-server"
@@ -1011,6 +1039,13 @@ SERVERS: List[ServerDef] = [
         resolve_root=_root_java,
         build_spawn=_spawn_jdtls,
         description="Java — Eclipse JDT Language Server",
+    ),
+    ServerDef(
+        server_id="roslyn",
+        extensions=(".cs", ".csx"),
+        resolve_root=_root_csharp,
+        build_spawn=_spawn_csharp,
+        description="C# — Roslyn Language Server (remote via node_client)",
     ),
 ]
 

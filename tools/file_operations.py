@@ -540,6 +540,10 @@ class ShellFileOperations(FileOperations):
         self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
                    getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
 
+        # Detect if we're operating via a node_client backend (for remote LSP)
+        self._node_id: Optional[str] = None
+        self._resolve_node_id()
+
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
     
@@ -1285,8 +1289,40 @@ class ShellFileOperations(FileOperations):
             output=(
                 "New lint errors introduced by this edit "
                 "(pre-existing errors filtered out):\n" + "\n".join(post_lines)
-            )
+            ),
         )
+
+    def _resolve_node_id(self) -> None:
+        """Detect if this FileOperations is backed by a node_client.
+
+        Checks workspace routing and environment attributes to determine
+        if file operations go through a remote node (e.g. dev-win01).
+        """
+        # 1. Check if env has a node_id attribute (future-proofing)
+        node_id = getattr(self.env, 'node_id', None)
+        if node_id:
+            self._node_id = node_id
+            return
+
+        # 2. Check workspace routing from current profile
+        try:
+            from agent.workspace_manager import get_active_workspace_node
+            node_id = get_active_workspace_node()
+            if node_id and node_id != "local":
+                self._node_id = node_id
+                return
+        except Exception:
+            pass
+
+        # 3. Check if we're in workspace-replace mode with a node target
+        try:
+            import os
+            ws_node = os.environ.get("HERMES_ACTIVE_NODE")
+            if ws_node and ws_node != "local":
+                self._node_id = ws_node
+                return
+        except Exception:
+            pass
 
     def _lsp_local_only(self) -> bool:
         """Return True iff this FileOperations is wired to a local backend.
@@ -1296,6 +1332,9 @@ class ShellFileOperations(FileOperations):
         Modal, SSH, Daytona) keep files inside the sandbox where the
         host-side LSP server can't reach them, so we skip the LSP
         path for those entirely.
+
+        Expanded: also returns True if backed by a node_client that
+        supports remote LSP (the LSP server runs on the node).
         """
         env = getattr(self, "env", None)
         if env is None:
@@ -1303,11 +1342,122 @@ class ShellFileOperations(FileOperations):
             # ``__new__`` without going through ``__init__``, so
             # ``self.env`` may be missing.  No env = no LSP path.
             return False
+        # Node client backend supports remote LSP
+        if getattr(self, '_node_id', None):
+            return True
         try:
             from tools.environments.local import LocalEnvironment
         except Exception:  # noqa: BLE001
             return False
         return isinstance(env, LocalEnvironment)
+
+    def _lsp_language_for_file(self, path: str) -> Optional[str]:
+        """Map file extension to LSP language identifier."""
+        ext = os.path.splitext(path)[1].lower()
+        mapping = {
+            '.cs': 'csharp',
+            '.py': 'python',
+            '.ts': 'typescript',
+            '.js': 'javascript',
+            '.rs': 'rust',
+            '.go': 'go',
+        }
+        return mapping.get(ext)
+
+    def _node_lsp_snapshot_baseline(self, path: str) -> None:
+        """Capture baseline via node_client's remote LSP server."""
+        node_id = getattr(self, '_node_id', None)
+        if not node_id:
+            return
+        lang = self._lsp_language_for_file(path)
+        if not lang:
+            return
+        try:
+            from tools.node_invoke import node_invoke
+            import json
+            result = node_invoke(node_id, "lsp", {
+                "action": "snapshot_baseline",
+                "language": lang,
+                "file_path": path,
+                "workspace_root": self.cwd,
+            }, timeout_ms=60000)
+            parsed = json.loads(result)
+            if parsed.get("error"):
+                logger.debug("Node LSP baseline failed: %s", parsed["error"])
+        except Exception:
+            pass
+
+    def _node_lsp_get_diagnostics(
+        self,
+        path: str,
+        *,
+        delta: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Get diagnostics via node_client's remote LSP server."""
+        node_id = getattr(self, '_node_id', None)
+        if not node_id:
+            return []
+        lang = self._lsp_language_for_file(path)
+        if not lang:
+            return []
+        try:
+            from tools.node_invoke import node_invoke
+            import json
+            result = node_invoke(node_id, "lsp", {
+                "action": "get_diagnostics",
+                "language": lang,
+                "file_path": path,
+                "workspace_root": self.cwd,
+                "delta": delta,
+            }, timeout_ms=60000)
+            parsed = json.loads(result)
+            if parsed.get("error"):
+                logger.debug("Node LSP diagnostics failed: %s", parsed["error"])
+                return []
+            # node_invoke wraps the result in {"ok": true, "payload": {...}, "error": null}
+            payload = parsed.get("payload", {})
+            if isinstance(payload, dict):
+                return payload.get("diagnostics", [])
+            return parsed.get("diagnostics", [])
+        except Exception:
+            return []
+
+    def _node_lsp_lint_after_write(
+        self,
+        path: str,
+        content: str,
+        *,
+        delta: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Run lint-after-write via node_client's remote LSP server."""
+        node_id = getattr(self, '_node_id', None)
+        if not node_id:
+            return []
+        lang = self._lsp_language_for_file(path)
+        if not lang:
+            return []
+        try:
+            from tools.node_invoke import node_invoke
+            import json
+            result = node_invoke(node_id, "lsp", {
+                "action": "lint_after_write",
+                "language": lang,
+                "file_path": path,
+                "workspace_root": self.cwd,
+                "content": content,
+                "delta": delta,
+            }, timeout_ms=60000)
+            parsed = json.loads(result)
+            if parsed.get("error"):
+                logger.debug("Node LSP lint failed: %s", parsed["error"])
+                return []
+            # node_invoke wraps the result in {"ok": true, "payload": {...}, "error": null}
+            payload = parsed.get("payload", {})
+            if isinstance(payload, dict):
+                return payload.get("diagnostics", [])
+            return parsed.get("diagnostics", [])
+        except Exception:
+            return []
 
     def _lsp_handles_extension(self, ext: str) -> bool:
         """Return True iff some registered LSP server claims this extension.
@@ -1340,7 +1490,15 @@ class ShellFileOperations(FileOperations):
 
         Skipped entirely on non-local backends (Docker, Modal, SSH,
         etc.) — the server can't see files inside the sandbox.
+
+        For node_client backends, delegates to the remote LSP server.
         """
+        # Node client backend supports remote LSP
+        node_id = getattr(self, '_node_id', None)
+        if node_id:
+            self._node_lsp_snapshot_baseline(path)
+            return
+
         if not self._lsp_local_only():
             return
         try:
@@ -1381,7 +1539,28 @@ class ShellFileOperations(FileOperations):
 
         Skipped entirely on non-local backends (Docker, Modal, SSH,
         etc.) — same reasoning as ``_snapshot_lsp_baseline``.
+
+        For node_client backends, delegates to the remote LSP server.
         """
+        # Node client backend supports remote LSP
+        node_id = getattr(self, '_node_id', None)
+        if node_id:
+            diags = self._node_lsp_lint_after_write(
+                path,
+                post_content or "",
+                delta=True,
+            )
+            if not diags:
+                return ""
+            try:
+                from agent.lsp.reporter import report_for_file, truncate
+                block = report_for_file(path, diags)
+                if not block:
+                    return ""
+                return truncate("LSP diagnostics introduced by this edit:\n" + block)
+            except Exception:  # noqa: BLE001
+                return ""
+
         if not self._lsp_local_only():
             return ""
         try:
