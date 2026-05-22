@@ -8046,6 +8046,8 @@ class HermesCLI:
                         print(f"  {status} {p['name']}{version}{detail}{error}")
             except Exception as e:
                 print(f"Plugin system error: {e}")
+        elif canonical == "calibration":
+            self._handle_calibration_command(cmd_original)
         elif canonical == "rollback":
             self._handle_rollback_command(cmd_original)
         elif canonical == "snapshot":
@@ -8654,6 +8656,102 @@ class HermesCLI:
             print("   disconnect   Revert to default browser backend")
             print("   status       Show current browser mode")
             print()
+
+    # ────────────────────────────────────────────────────────────────
+    # /calibration — bias detection status
+    # ────────────────────────────────────────────────────────────────
+    def _handle_calibration_command(self, cmd: str):
+        """Handle /calibration status|reset|domains — show bias patterns and stats."""
+        parts = cmd.strip().split(None, 1)
+        sub = parts[1].lower().strip() if len(parts) > 1 else "status"
+
+        try:
+            from plugins.observability.calibration import CalibrationDB, infer_domain
+            from hermes_constants import get_hermes_home
+            from pathlib import Path
+
+            db_path = Path(get_hermes_home()) / "calibration.db"
+            if not db_path.exists():
+                print("No calibration data yet. Run some tool calls first.")
+                return
+
+            db = CalibrationDB(db_path)
+
+            if sub == "status":
+                patterns = db.get_active_bias_patterns()
+                print()
+                if patterns:
+                    print("Active bias patterns:")
+                    for p in patterns:
+                        acc = p["accuracy_rate"] * 100
+                        print(f"  ⚠ {p['domain']}: {acc:.0f}% accuracy ({p['occurrence_count']} calls)")
+                else:
+                    print("No active bias patterns detected.")
+
+                # Show domain stats summary
+                print()
+                print("Domain statistics:")
+                # Get all domains from judgments
+                import sqlite3
+                conn = sqlite3.connect(str(db_path))
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT j.domain,
+                           COUNT(*) AS total,
+                           SUM(o.success) AS success
+                    FROM judgments j
+                    JOIN outcomes o ON o.judgment_id = j.id
+                    GROUP BY j.domain
+                    ORDER BY total DESC
+                    """
+                ).fetchall()
+                conn.close()
+
+                if rows:
+                    for r in rows:
+                        total = r["total"]
+                        success = r["success"] or 0
+                        acc = (success / total * 100) if total > 0 else 0
+                        marker = "⚠" if acc < 50 and total >= 5 else "✓"
+                        print(f"  {marker} {r['domain']}: {success}/{total} ({acc:.0f}%)")
+                else:
+                    print("  No data recorded yet.")
+                print()
+
+            elif sub == "domains":
+                print()
+                print("Supported domains:")
+                domains = [
+                    "powershell", "csharp", "web_research", "azure_deploy",
+                    "python", "javascript", "rust", "go", "docker", "kubernetes",
+                    "file_ops", "git", "scheduling", "memory", "database",
+                    "remote", "build", "node_operations", "general",
+                ]
+                for d in domains:
+                    print(f"  {d}")
+                print()
+
+            elif sub == "reset":
+                # Clear nudge cooldowns
+                import sqlite3
+                conn = sqlite3.connect(str(db_path))
+                cur = conn.execute("DELETE FROM nudge_log")
+                conn.commit()
+                conn.close()
+                print(f"Cleared {cur.rowcount} nudge cooldown entries.")
+
+            else:
+                print()
+                print("Usage: /calibration [status|domains|reset]")
+                print()
+                print("   status   Show active bias patterns and domain stats")
+                print("   domains  List all supported calibration domains")
+                print("   reset    Clear nudge cooldowns")
+                print()
+
+        except Exception as e:
+            print(f"Calibration error: {e}")
 
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop)

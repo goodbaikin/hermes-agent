@@ -192,6 +192,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("connect", "disconnect", "status")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
+    CommandDef("calibration", "Show calibration status and bias patterns",
+               "Tools & Skills", cli_only=True,
+               args_hint="[status|reset|domains]",
+               subcommands=("status", "reset", "domains")),
 
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",

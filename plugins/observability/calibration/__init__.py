@@ -48,9 +48,15 @@ _DOMAIN_RULES: List[Tuple[str, Optional[str], str]] = [
     # PowerShell / Azure
     ("terminal", "powershell", "powershell"),
     ("terminal", "pwsh", "powershell"),
+    ("terminal", ".ps1", "powershell"),
+    ("terminal", "get-az", "powershell"),
+    ("terminal", "new-az", "powershell"),
+    ("terminal", "set-az", "powershell"),
     # C# / .NET
     ("terminal", "dotnet", "csharp"),
     ("terminal", "msbuild", "csharp"),
+    ("terminal", ".csproj", "csharp"),
+    ("terminal", ".sln", "csharp"),
     # Web research
     ("browser_", None, "web_research"),
     ("web_search", None, "web_research"),
@@ -58,10 +64,40 @@ _DOMAIN_RULES: List[Tuple[str, Optional[str], str]] = [
     # Azure deploy (Bicep)
     ("patch", ".bicep", "azure_deploy"),
     ("write_file", ".bicep", "azure_deploy"),
+    ("terminal", "az ", "azure_deploy"),
+    ("terminal", "azdeploy", "azure_deploy"),
+    ("terminal", "new-azresourcegroupdeployment", "azure_deploy"),
     # Python
     ("patch", ".py", "python"),
     ("write_file", ".py", "python"),
     ("execute_code", None, "python"),
+    # JavaScript / TypeScript
+    ("patch", ".js", "javascript"),
+    ("patch", ".ts", "javascript"),
+    ("write_file", ".js", "javascript"),
+    ("write_file", ".ts", "javascript"),
+    ("terminal", "npm", "javascript"),
+    ("terminal", "node", "javascript"),
+    ("terminal", "pnpm", "javascript"),
+    ("terminal", "yarn", "javascript"),
+    # Rust
+    ("patch", ".rs", "rust"),
+    ("write_file", ".rs", "rust"),
+    ("terminal", "cargo", "rust"),
+    # Go
+    ("patch", ".go", "go"),
+    ("write_file", ".go", "go"),
+    # Docker
+    ("terminal", "docker", "docker"),
+    ("terminal", "docker-compose", "docker"),
+    ("patch", "dockerfile", "docker"),
+    ("write_file", "dockerfile", "docker"),
+    # Kubernetes
+    ("terminal", "kubectl", "kubernetes"),
+    ("patch", ".yaml", "kubernetes"),
+    ("write_file", ".yaml", "kubernetes"),
+    ("patch", ".yml", "kubernetes"),
+    ("write_file", ".yml", "kubernetes"),
     # File operations (generic)
     ("read_file", None, "file_ops"),
     ("search_files", None, "file_ops"),
@@ -73,6 +109,17 @@ _DOMAIN_RULES: List[Tuple[str, Optional[str], str]] = [
     ("hindsight_retain", None, "memory"),
     ("hindsight_recall", None, "memory"),
     ("memory", None, "memory"),
+    # Database
+    ("terminal", "psql", "database"),
+    ("terminal", "mysql", "database"),
+    ("terminal", "sqlite3", "database"),
+    # SSH / Remote
+    ("terminal", "ssh", "remote"),
+    ("terminal", "scp", "remote"),
+    # Build tools
+    ("terminal", "make", "build"),
+    ("terminal", "cmake", "build"),
+    ("terminal", "ninja", "build"),
 ]
 
 
@@ -395,6 +442,10 @@ def _is_success(result: str) -> Tuple[bool, Optional[str]]:
 _db: Optional[CalibrationDB] = None
 _db_lock = threading.Lock()
 
+# Thread-local storage for nudge messages that need to be injected into
+# tool results via transform_tool_result.
+_nudge_tls = threading.local()
+
 
 def _get_db() -> CalibrationDB:
     global _db
@@ -448,6 +499,12 @@ def post_tool_call(
         )
     except Exception as exc:
         logger.debug("Calibration post_tool_call error: %s", exc)
+    finally:
+        # Clear any pending nudge for this thread
+        try:
+            delattr(_nudge_tls, "message")
+        except AttributeError:
+            pass
 
 
 def pre_tool_call(
@@ -458,10 +515,10 @@ def pre_tool_call(
     tool_call_id: str = "",
     **kwargs: Any,
 ) -> Optional[Dict[str, Any]]:
-    """Check for active bias patterns and nudge if needed.
+    """Check for active bias patterns and stage a nudge if needed.
 
-    Returns {"action": "block", "message": "..."} to block the tool call,
-    or None to allow it.
+    The nudge is stored thread-locally and injected into the tool result
+    by transform_tool_result.  Returns None (never blocks).
     """
     try:
         db = _get_db()
@@ -488,13 +545,54 @@ def pre_tool_call(
         # Log the nudge
         db.record_nudge(domain, tool_name, msg)
 
-        # Return as a warning (non-blocking) — we don't block, just warn
-        # The warning will be injected into the tool result context
+        # Stage for injection into tool result
+        _nudge_tls.message = msg
+        _nudge_tls.domain = domain
+        _nudge_tls.tool_name = tool_name
+
         logger.warning(msg)
-        return None  # Don't block; the warning is already logged
+        return None
 
     except Exception as exc:
         logger.debug("Calibration pre_tool_call error: %s", exc)
+        return None
+
+
+def transform_tool_result(
+    tool_name: str,
+    args: Dict[str, Any],
+    result: str,
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    duration_ms: int = 0,
+    **kwargs: Any,
+) -> Optional[str]:
+    """Inject pending nudge messages into tool results.
+
+    Returns the modified result string if a nudge is pending, else None.
+    """
+    try:
+        msg = getattr(_nudge_tls, "message", None)
+        if not msg:
+            return None
+
+        # Inject nudge at the top of the result
+        # Try to preserve JSON structure if the result is JSON
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict):
+                # Add calibration warning as a special field
+                data["_calibration_warning"] = msg
+                return json.dumps(data, ensure_ascii=False, default=str)
+        except Exception:
+            pass
+
+        # Non-JSON or parse failed: prepend as plain text
+        return f"{msg}\n\n{result}"
+
+    except Exception as exc:
+        logger.debug("Calibration transform_tool_result error: %s", exc)
         return None
 
 
@@ -534,4 +632,5 @@ def register(ctx) -> None:
     """Register calibration hooks with the plugin manager."""
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
+    ctx.register_hook("transform_tool_result", transform_tool_result)
     logger.info("Calibration plugin registered")

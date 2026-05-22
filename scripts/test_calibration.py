@@ -24,6 +24,7 @@ from plugins.observability.calibration import (
     _is_success,
     post_tool_call,
     pre_tool_call,
+    transform_tool_result,
 )
 
 
@@ -32,6 +33,10 @@ def test_infer_domain():
     cases = [
         (("terminal", {"command": "powershell -c 'Get-Process'"}), "powershell"),
         (("terminal", {"command": "dotnet build"}), "csharp"),
+        (("terminal", {"command": "npm install"}), "javascript"),
+        (("terminal", {"command": "cargo build"}), "rust"),
+        (("terminal", {"command": "docker ps"}), "docker"),
+        (("terminal", {"command": "kubectl get pods"}), "kubernetes"),
         (("browser_navigate", {"url": "https://example.com"}), "web_research"),
         (("patch", {"path": "main.bicep"}), "azure_deploy"),
         (("write_file", {"path": "test.py"}), "python"),
@@ -149,13 +154,52 @@ def test_hooks():
         assert abs(patterns[0]["accuracy"] - 0.3) < 0.01
         print("  post_tool_call hook + bias detection: OK")
 
-        # Pre-tool call should warn (logged to stderr) but not block
+        # Pre-tool call should stage nudge (non-blocking)
         result = pre_tool_call(
             tool_name="terminal",
             args={"command": "powershell -c 'something'"},
         )
         assert result is None  # non-blocking nudge
         print("  pre_tool_call hook: OK")
+
+        # Transform tool result should inject nudge into JSON result
+        nudge_result = transform_tool_result(
+            tool_name="terminal",
+            args={"command": "powershell -c 'something'"},
+            result='{"output": "ok"}',
+        )
+        assert nudge_result is not None
+        parsed = json.loads(nudge_result)
+        assert "_calibration_warning" in parsed
+        assert "powershell" in parsed["_calibration_warning"]
+        print("  transform_tool_result JSON injection: OK")
+
+        # Transform tool result should inject nudge into plain text result
+        nudge_result2 = transform_tool_result(
+            tool_name="terminal",
+            args={"command": "powershell -c 'something'"},
+            result="plain text output",
+        )
+        assert nudge_result2 is not None
+        assert nudge_result2.startswith("[calibration]")
+        assert "plain text output" in nudge_result2
+        print("  transform_tool_result plain text injection: OK")
+
+        # Clear nudge state
+        post_tool_call(
+            tool_name="terminal",
+            args={"command": "powershell -c 'cleanup'"},
+            result='{"output": "ok"}',
+        )
+
+        # After post_tool_call, nudge should be cleared
+        nudge_result3 = transform_tool_result(
+            tool_name="terminal",
+            args={"command": "powershell -c 'something'"},
+            result='{"output": "ok"}',
+        )
+        assert nudge_result3 is None  # no nudge staged
+        print("  nudge cleanup after post_tool_call: OK")
 
     finally:
         calib._db = orig_db
