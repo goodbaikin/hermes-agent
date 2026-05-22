@@ -25,6 +25,7 @@ Session context:
 
 import logging
 import os
+import re
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path

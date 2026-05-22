@@ -133,14 +133,33 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
 
         elif tool_name == "write_file":
             node_lib.node_write(node_id, params["path"], params["content"])
-            return json.dumps({"ok": True, "message": f"Written to {params['path']} on {node_id}"})
+            # Run LSP diagnostics for supported file types
+            lsp_diags = node_lib.node_lsp_lint(
+                node_id, params["path"], params["content"],
+                workspace_root=_get_workspace_workdir()
+            )
+            result = {"ok": True, "message": f"Written to {params['path']} on {node_id}"}
+            if lsp_diags:
+                from agent.lsp.remote_client import format_diagnostics
+                result["lsp_diagnostics"] = format_diagnostics(lsp_diags, params["path"])
+            return json.dumps(result, ensure_ascii=False)
 
         elif tool_name == "patch":
             if params.get("mode") == "replace":
                 node_lib.node_patch(node_id, params["path"], [
                     {"old": params["old_string"], "new": params.get("new_string", "")}
                 ])
-                return json.dumps({"success": True, "message": f"Patched {params['path']} on {node_id}"})
+                # Read back patched content for LSP diagnostics
+                patched_content = node_lib.node_read(node_id, params["path"])
+                lsp_diags = node_lib.node_lsp_lint(
+                    node_id, params["path"], patched_content,
+                    workspace_root=_get_workspace_workdir()
+                )
+                result = {"success": True, "message": f"Patched {params['path']} on {node_id}"}
+                if lsp_diags:
+                    from agent.lsp.remote_client import format_diagnostics
+                    result["lsp_diagnostics"] = format_diagnostics(lsp_diags, params["path"])
+                return json.dumps(result, ensure_ascii=False)
             else:
                 return json.dumps({"error": "V4A patch not supported on remote"})
 

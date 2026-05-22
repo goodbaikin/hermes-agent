@@ -1306,11 +1306,39 @@ class ShellFileOperations(FileOperations):
 
         # 2. Check workspace routing from current profile
         try:
-            from agent.workspace_manager import get_active_workspace_node
-            node_id = get_active_workspace_node()
-            if node_id and node_id != "local":
-                self._node_id = node_id
+            # 2a. Try contextvars first (set by conversation_loop per session)
+            from agent.workspace_context import get_workspace
+            ctx_ws = get_workspace()
+            if ctx_ws:
+                from agent.workspace_manager import get_workspace_manager
+                wm = get_workspace_manager()
+                ws = wm.get_workspace(ctx_ws)
+                if ws and ws.node_id and ws.node_id != "local":
+                    self._node_id = ws.node_id
+                    return
+
+            # 2b. Fallback to WorkspaceManager singleton
+            from agent.workspace_manager import get_workspace_manager
+            wm = get_workspace_manager()
+            active_ws = wm.get_active()
+            if active_ws and active_ws.node_id and active_ws.node_id != "local":
+                self._node_id = active_ws.node_id
                 return
+            # 2c. Match by cwd path prefix against all workspaces
+            cwd = getattr(self, 'cwd', '') or ''
+            for name in wm.list_workspaces():
+                ws = wm.get_workspace(name)
+                if ws and ws.path_prefixes:
+                    for prefix in ws.path_prefixes:
+                        norm_cwd = cwd.replace('\\', '/')
+                        norm_prefix = prefix.replace('\\', '/')
+                        if norm_prefix.startswith('~/'):
+                            import os
+                            norm_prefix = os.path.expanduser(norm_prefix).replace('\\', '/')
+                        if norm_cwd.startswith(norm_prefix):
+                            if ws.node_id and ws.node_id != "local":
+                                self._node_id = ws.node_id
+                                return
         except Exception:
             pass
 

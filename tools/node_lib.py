@@ -124,6 +124,50 @@ def node_patch(node_id: str, path: str, changes: List[Dict[str, Any]]) -> Dict[s
     return node_write(node_id, path, text)
 
 
+def node_lsp_lint(node_id: str, path: str, content: str, workspace_root: str = None) -> List[Dict[str, Any]]:
+    """Run LSP diagnostics on a file after write/patch.
+
+    Returns a list of diagnostic dicts, or empty list if LSP is unavailable.
+    """
+    # Map file extension to LSP language identifier
+    import os
+    ext = os.path.splitext(path)[1].lower()
+    lang_map = {
+        '.cs': 'csharp',
+        '.py': 'python',
+        '.ts': 'typescript',
+        '.js': 'javascript',
+        '.rs': 'rust',
+        '.go': 'go',
+    }
+    lang = lang_map.get(ext)
+    if not lang:
+        return []
+
+    if workspace_root is None:
+        # Derive workspace root from file path (parent directory)
+        workspace_root = str(os.path.dirname(path) or ".")
+
+    try:
+        result_str = node_invoke(node_id, "lsp", {
+            "action": "lint_after_write",
+            "language": lang,
+            "file_path": path,
+            "workspace_root": workspace_root,
+            "content": content,
+            "delta": True,
+        }, timeout_ms=60000)
+        result = json.loads(result_str)
+        if not result.get("ok"):
+            return []
+        payload = result.get("payload", {})
+        if isinstance(payload, dict):
+            return payload.get("diagnostics", [])
+        return []
+    except Exception:
+        return []
+
+
 def node_exec(node_id: str, cmd: str, timeout: int = 30, cwd: str = None) -> Dict[str, Any]:
     """Execute a command on a node."""
     params = {
