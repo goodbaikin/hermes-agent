@@ -1,0 +1,7 @@
+name: calibration
+version: "1.0.0"
+description: "LLM bias detection and self-correction for Hermes. Tracks tool-call outcomes per domain, detects recurring failure patterns, and warns before repeating known mistakes. Inspired by gbrain's calibration system."
+author: nphard
+hooks:
+  - pre_tool_call
+  - post_tool_call
