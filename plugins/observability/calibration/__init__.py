@@ -517,10 +517,21 @@ def pre_tool_call(
 ) -> Optional[Dict[str, Any]]:
     """Check for active bias patterns and stage a nudge if needed.
 
-    The nudge is stored thread-locally and injected into the tool result
-    by transform_tool_result.  Returns None (never blocks).
+    Also detects repetitive tool-call loops.  The nudge is stored thread-locally
+    and injected into the tool result by transform_tool_result.
+    Returns None (never blocks).
     """
     try:
+        # --- Loop detection (runs first, lightweight) -------------------------
+        loop_msg = _detect_loop(tool_name, args)
+        if loop_msg:
+            _nudge_tls.message = loop_msg
+            _nudge_tls.domain = "loop_detection"
+            _nudge_tls.tool_name = tool_name
+            logger.warning(loop_msg)
+            return None
+
+        # --- Bias-pattern nudge -----------------------------------------------
         db = _get_db()
         domain = infer_domain(tool_name, args)
 
@@ -597,7 +608,50 @@ def transform_tool_result(
 
 
 # ---------------------------------------------------------------------------
-# Bias detection trigger
+# Loop detection
+# ---------------------------------------------------------------------------
+
+_LOOP_WINDOW_SIZE = 20       # keep last N calls in memory
+_LOOP_REPEAT_THRESHOLD = 3   # same (tool, args) this many times = loop
+_LOOP_TIME_WINDOW_SEC = 120  # within this many seconds
+
+_loop_history: List[Dict[str, Any]] = []
+_loop_history_lock = threading.Lock()
+
+
+def _detect_loop(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Check if the same tool+args has been called repeatedly in a short window.
+
+    Returns a warning message if a loop is detected, else None.
+    """
+    global _loop_history
+    args_json = json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)
+    key = f"{tool_name}:{args_json}"
+    now = time.time()
+
+    with _loop_history_lock:
+        # Prune old entries outside the time window
+        cutoff = now - _LOOP_TIME_WINDOW_SEC
+        _loop_history = [h for h in _loop_history if h["ts"] > cutoff]
+
+        # Count occurrences of this exact call
+        count = sum(1 for h in _loop_history if h["key"] == key)
+
+        # Record this call
+        _loop_history.append({"key": key, "ts": now})
+
+        # Trim to window size
+        if len(_loop_history) > _LOOP_WINDOW_SIZE:
+            _loop_history = _loop_history[-_LOOP_WINDOW_SIZE:]
+
+        if count >= _LOOP_REPEAT_THRESHOLD - 1:  # -1 because we just added this one
+            return (
+                f"[calibration] Loop detected: '{tool_name}' with same arguments "
+                f"has been called {count + 1} times in the last {_LOOP_TIME_WINDOW_SEC}s. "
+                f"Consider stepping back and reviewing your approach."
+            )
+
+    return None
 # ---------------------------------------------------------------------------
 
 _bias_counter = 0

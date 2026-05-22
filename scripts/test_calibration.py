@@ -127,9 +127,12 @@ def test_hooks():
     # Monkey-patch _get_db to use temp DB
     import plugins.observability.calibration as calib
     orig_db = calib._db
+    # Clear loop history for clean test
+    orig_loop_history = list(calib._loop_history)
     try:
         calib._db = CalibrationDB(db_path)
         calib._bias_counter = 0  # reset counter for clean test
+        calib._loop_history = []  # clear loop history
 
         # Simulate successful tool calls (all in powershell domain)
         for i in range(3):
@@ -201,8 +204,56 @@ def test_hooks():
         assert nudge_result3 is None  # no nudge staged
         print("  nudge cleanup after post_tool_call: OK")
 
+        # --- Loop detection tests -------------------------------------------
+        calib._loop_history = []  # clear for loop tests
+
+        # First 2 calls with same args — no loop yet
+        for i in range(2):
+            pre_tool_call(tool_name="read_file", args={"path": "/etc/passwd"})
+            post_tool_call(
+                tool_name="read_file",
+                args={"path": "/etc/passwd"},
+                result='{"content": "root:x:0:0"}',
+            )
+        loop_nudge = transform_tool_result(
+            tool_name="read_file",
+            args={"path": "/etc/passwd"},
+            result='{"content": "root:x:0:0"}',
+        )
+        assert loop_nudge is None  # only 2 calls, no loop
+        print("  loop detection (2 calls, no alert): OK")
+
+        # 3rd call with same args — loop detected
+        pre_tool_call(tool_name="read_file", args={"path": "/etc/passwd"})
+        loop_nudge = transform_tool_result(
+            tool_name="read_file",
+            args={"path": "/etc/passwd"},
+            result='{"content": "root:x:0:0"}',
+        )
+        assert loop_nudge is not None
+        assert "Loop detected" in loop_nudge
+        assert "read_file" in loop_nudge
+        print("  loop detection (3 calls, alert fired): OK")
+
+        # Different args — should not trigger loop
+        calib._loop_history = []  # clear
+        pre_tool_call(tool_name="read_file", args={"path": "/etc/hosts"})
+        post_tool_call(
+            tool_name="read_file",
+            args={"path": "/etc/hosts"},
+            result='{"content": "127.0.0.1 localhost"}',
+        )
+        no_loop = transform_tool_result(
+            tool_name="read_file",
+            args={"path": "/etc/hosts"},
+            result='{"content": "127.0.0.1 localhost"}',
+        )
+        assert no_loop is None
+        print("  loop detection (different args, no alert): OK")
+
     finally:
         calib._db = orig_db
+        calib._loop_history = orig_loop_history
         db_path.unlink(missing_ok=True)
 
 
