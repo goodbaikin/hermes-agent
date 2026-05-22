@@ -200,6 +200,7 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
+    agent.profile = profile  # Active profile name (e.g. "csharp-eng")
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_name = user_name
     agent._chat_id = chat_id

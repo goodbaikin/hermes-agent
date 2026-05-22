@@ -18,12 +18,14 @@ class Workspace:
         path_prefixes: Optional[List[str]] = None,
         tools: Optional[List[str]] = None,
         description: str = "",
+        platform: str = "",
     ):
         self.name = name
         self.node_id = node_id
         self.path_prefixes = path_prefixes or []
         self.tools = set(tools or ["all"])
         self.description = description
+        self.platform = platform
 
     def matches_path(self, path: str) -> bool:
         """Check if the given path falls under this workspace."""
@@ -66,6 +68,7 @@ class Workspace:
             "path_prefixes": self.path_prefixes,
             "tools": list(self.tools),
             "description": self.description,
+            "platform": self.platform,
         }
 
     @classmethod
@@ -76,4 +79,5 @@ class Workspace:
             path_prefixes=data.get("path_prefixes", []),
             tools=data.get("tools", ["all"]),
             description=data.get("description", ""),
+            platform=data.get("platform", ""),
         )

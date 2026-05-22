@@ -742,7 +742,7 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
-def build_environment_hints() -> str:
+def build_environment_hints(profile: Optional[str] = None) -> str:
     """Return environment-specific guidance for the system prompt.
 
     Always emits a factual block describing the execution environment:
@@ -798,6 +798,63 @@ def build_environment_hints() -> str:
         # know this or it will issue PowerShell syntax and fail.
         if sys.platform == "win32" and not is_wsl():
             hints.append(_WINDOWS_BASH_SHELL_HINT)
+
+        # --- Workspace replace mode: inform the model where tools actually run ---
+        try:
+            import yaml
+            from hermes_constants import get_hermes_home
+            from hermes_cli.profiles import get_profile_dir
+
+            # Resolve config path: profile-specific if given, else global
+            if profile:
+                config_path = os.path.join(get_profile_dir(profile), "config.yaml")
+            else:
+                config_path = os.path.join(get_hermes_home(), "config.yaml")
+
+            cfg = {}
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+
+            ws_mode = cfg.get("workspace_mode", "extend")
+            if ws_mode == "replace":
+                active_ws_name = cfg.get("active_workspace", "default")
+                workspaces = cfg.get("workspaces", {})
+                ws_data = workspaces.get(active_ws_name)
+                if ws_data:
+                    ws_name = active_ws_name
+                    ws_node_id = ws_data.get("node_id", "local")
+                    ws_path_prefixes = ws_data.get("path_prefixes", [])
+                    ws_description = ws_data.get("description", "")
+                    ws_platform = ws_data.get("platform", "")
+
+                    if ws_name != "default" and ws_node_id != "local":
+                        # Determine OS from explicit platform field, then fall back to heuristics
+                        if ws_platform:
+                            os_hint = ws_platform.capitalize()
+                        elif (
+                            ws_node_id.startswith(("dev-win", "win-"))
+                            or any(p.startswith("C:/") or p.startswith("C:\\\\") for p in ws_path_prefixes)
+                        ):
+                            os_hint = "Windows"
+                        else:
+                            os_hint = "Linux"
+                        cwd = ws_path_prefixes[0] if ws_path_prefixes else "(unknown)"
+                        ws_lines = [
+                            f"Workspace execution context: {ws_name} -> {ws_node_id} ({os_hint})",
+                            f"Default working directory: {cwd}",
+                        ]
+                        if ws_description:
+                            ws_lines.append(f"Description: {ws_description}")
+                        ws_lines.append(
+                            "ALL file and terminal operations are executed on this "
+                            f"remote node ({ws_node_id}), NOT on the local machine. "
+                            "Use absolute paths or paths relative to the default "
+                            "working directory above."
+                        )
+                        hints.append("\n".join(ws_lines))
+        except Exception:
+            pass
     else:
         # --- Remote backend block (host info suppressed) ---
         probe = _probe_remote_backend(backend)
