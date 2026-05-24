@@ -2,23 +2,31 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from aiohttp import web
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_model_config(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 
 def _normalize_session_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if record is None:
         return None
     normalized = dict(record)
-    model_config = normalized.get("model_config")
+    model_config = _parse_model_config(normalized.get("model_config"))
     if model_config:
-        try:
-            import json
-            normalized["model_config"] = json.loads(model_config)
-        except (TypeError, json.JSONDecodeError):
-            pass
+        normalized["model_config"] = model_config
     return {
         "id": normalized.get("id") or normalized.get("session_id"),
         "session_id": normalized.get("session_id") or normalized.get("id"),
@@ -39,6 +47,108 @@ def _normalize_session_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]
         "parent_session_id": normalized.get("parent_session_id"),
         "model_config": normalized.get("model_config"),
     }
+
+
+def _clean_model_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = ("model", "provider", "base_url", "api_mode", "provider_label", "resolved_via_alias")
+    return {
+        key: str(config.get(key) or "").strip()
+        for key in allowed
+        if str(config.get(key) or "").strip()
+    }
+
+
+def _resolve_session_model_config(body: Dict[str, Any], current_session: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve a PATCH/POST body into a safe session model override.
+
+    Returns (model, model_config, error). api_key is intentionally never stored.
+    """
+    raw_cfg = _parse_model_config(body.get("model_config"))
+    if body.get("model_config") is None and "model_config" in body:
+        return None, None, None
+
+    model = str(body.get("model") or raw_cfg.get("model") or "").strip()
+    provider = str(body.get("provider") or raw_cfg.get("provider") or "").strip()
+    base_url = str(body.get("base_url") or raw_cfg.get("base_url") or "").strip()
+    api_mode = str(body.get("api_mode") or raw_cfg.get("api_mode") or "").strip()
+
+    if not (model or provider or base_url or api_mode):
+        return None, None, "model or provider required"
+
+    try:
+        from api_server.handlers.config import _current_model_settings
+        from hermes_cli.config import load_config
+        from hermes_cli.model_switch import switch_model
+
+        config = load_config()
+        current = _current_model_settings(config)
+        current_model = str(current.get("model") or "").strip()
+        current_provider = str(current.get("provider") or "").strip()
+        current_base_url = str(current.get("base_url") or "").strip()
+        session_cfg = _parse_model_config((current_session or {}).get("model_config"))
+        if session_cfg.get("model"):
+            current_model = str(session_cfg.get("model") or "").strip()
+        if session_cfg.get("provider"):
+            current_provider = str(session_cfg.get("provider") or "").strip()
+        if session_cfg.get("base_url"):
+            current_base_url = str(session_cfg.get("base_url") or "").strip()
+
+        result = switch_model(
+            model or current_model,
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            is_global=False,
+            explicit_provider=provider,
+            user_providers=config.get("providers") or {},
+            custom_providers=config.get("custom_providers") or [],
+        )
+        if result.success:
+            resolved = _clean_model_config({
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+                "provider_label": result.provider_label,
+                "resolved_via_alias": result.resolved_via_alias,
+            })
+            if base_url:
+                resolved["base_url"] = base_url
+            if api_mode:
+                resolved["api_mode"] = api_mode
+            return resolved.get("model"), resolved, None
+    except Exception as exc:
+        logger.debug("Session model switch resolution failed; falling back to runtime provider: %s", exc, exc_info=True)
+
+    # Deliberate fallback: allow provider-backed models that are not yet in the
+    # catalog (subscription endpoints often expose new names before models.dev).
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.providers import determine_api_mode, get_label
+        from hermes_cli.model_normalize import normalize_model_for_provider
+
+        requested_provider = provider or raw_cfg.get("provider") or None
+        runtime = resolve_runtime_provider(
+            requested=requested_provider,
+            explicit_base_url=base_url or None,
+            target_model=model or None,
+        )
+        resolved_provider = str(runtime.get("provider") or requested_provider or "").strip()
+        resolved_model = normalize_model_for_provider(model, resolved_provider) if model else model
+        resolved_base_url = base_url or str(runtime.get("base_url") or "").strip()
+        resolved_api_mode = api_mode or str(runtime.get("api_mode") or "").strip() or determine_api_mode(resolved_provider, resolved_base_url)
+        resolved = _clean_model_config({
+            "model": resolved_model,
+            "provider": resolved_provider,
+            "base_url": resolved_base_url,
+            "api_mode": resolved_api_mode,
+            "provider_label": get_label(resolved_provider),
+        })
+        if not resolved.get("model"):
+            return None, None, "model required"
+        return resolved.get("model"), resolved, None
+    except Exception as exc:
+        return None, None, f"Could not resolve session model: {exc}"
 
 
 async def handle_list_sessions(request: web.Request, *, check_auth, ensure_session_db) -> web.Response:
@@ -99,6 +209,16 @@ async def handle_create_session(request: web.Request, *, check_auth, ensure_sess
         title = str(body.get("title") or "").strip() or None
         source = str(body.get("source") or "api_server").strip() or "api_server"
         model = str(body.get("model") or "").strip() or None
+        model_config = None
+        has_model_override = bool(model) or any(
+            key in body for key in ("model_config", "provider", "base_url", "api_mode")
+        )
+        if has_model_override:
+            resolved_model, resolved_config, err = _resolve_session_model_config(body)
+            if err:
+                return web.json_response({"error": err}, status=400)
+            model = resolved_model
+            model_config = resolved_config
         system_prompt = str(body.get("system_prompt") or "").strip() or None
         profile = str(body.get("profile") or "").strip() or None
         db = ensure_session_db()
@@ -108,6 +228,7 @@ async def handle_create_session(request: web.Request, *, check_auth, ensure_sess
             session_id=session_id,
             source=source,
             model=model,
+            model_config=model_config,
             system_prompt=system_prompt,
             profile=profile,
         )
@@ -147,8 +268,29 @@ async def handle_update_session(request: web.Request, *, check_auth, ensure_sess
             db.update_system_prompt(resolved, str(body.get("system_prompt") or "").strip())
         if "end_reason" in body:
             db.end_session(resolved, str(body.get("end_reason") or "updated"))
+        if any(key in body for key in ("model", "model_config", "provider", "base_url", "api_mode")):
+            current = db.get_session(resolved)
+            if current is None:
+                return web.json_response({"error": "Session not found"}, status=404)
+            resolved_model, resolved_config, err = _resolve_session_model_config(body, current_session=current)
+            if err:
+                return web.json_response({"error": err}, status=400)
+            if hasattr(db, "update_session_model"):
+                ok = db.update_session_model(resolved, resolved_model, resolved_config)
+            else:
+                def _do(conn):
+                    cur = conn.execute(
+                        "UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
+                        (resolved_model, json.dumps(resolved_config) if resolved_config else None, resolved),
+                    )
+                    return cur.rowcount
+                ok = (db._execute_write(_do) or 0) > 0
+            if not ok:
+                return web.json_response({"error": "Session not found"}, status=404)
         item = db.get_session(resolved)
-        return web.json_response({"session": _normalize_session_record(item or {"id": resolved})})
+        if item is None:
+            return web.json_response({"error": "Session not found"}, status=404)
+        return web.json_response({"session": _normalize_session_record(item)})
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except Exception as e:

@@ -1,8 +1,6 @@
 import os
 from aiohttp import web
 
-from gateway.status import read_runtime_status
-
 
 async def handle_health(request: web.Request) -> web.Response:
     """GET /health -- simple health check."""
@@ -16,6 +14,8 @@ async def handle_health_detailed(request: web.Request) -> web.Response:
     dashboard can display full status without needing a shared PID file or
     /proc access.  No authentication required.
     """
+    from gateway.status import read_runtime_status
+
     runtime = read_runtime_status() or {}
     return web.json_response({
         "status": "ok",

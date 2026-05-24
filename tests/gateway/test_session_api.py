@@ -14,6 +14,7 @@ Tests cover:
 import json
 import time
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -83,12 +84,15 @@ def _mock_session_db():
     db.list_sessions_rich.return_value = []
     db.session_count.return_value = 0
     db.get_session.return_value = None
+    db.resolve_session_id.side_effect = lambda session_id: session_id
     db.get_messages.return_value = []
+    db.message_count.side_effect = lambda *args, **kwargs: len(db.get_messages.return_value)
     db.get_messages_as_conversation.return_value = []
     db.search_messages.return_value = []
     db.create_session.return_value = None
     db.set_session_title.return_value = True
     db.update_system_prompt.return_value = None
+    db.update_session_model.return_value = True
     db.end_session.return_value = None
     db.delete_session.return_value = True
     db.ensure_session.return_value = None
@@ -215,6 +219,71 @@ class TestCreateSession:
             assert resp.status == 200
             data = await resp.json()
             assert data["session"]["title"] == "My Chat"
+
+    @pytest.mark.asyncio
+    async def test_create_session_with_model_resolves_session_override(self, adapter):
+        """POST /api/sessions with a model must persist a usable session-scoped override."""
+        adapter._session_db.get_session.return_value = {
+            "session_id": "sess_new",
+            "source": "webui",
+            "model": "gpt-5.3-codex-spark",
+            "model_config": json.dumps({
+                "model": "gpt-5.3-codex-spark",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            }),
+        }
+        switch_result = SimpleNamespace(
+            success=True,
+            new_model="gpt-5.3-codex-spark",
+            target_provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+            provider_label="OpenAI Codex",
+            resolved_via_alias="",
+        )
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("hermes_cli.config.load_config", return_value={"model": {"default": "kimi-k2.6", "provider": "openrouter"}}), \
+                 patch("hermes_cli.model_switch.switch_model", return_value=switch_result):
+                resp = await cli.post(
+                    "/api/sessions",
+                    json={"source": "webui", "model": "gpt-5.3-codex-spark", "provider": "openai-codex"},
+                )
+        assert resp.status == 200
+        kwargs = adapter._session_db.create_session.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.3-codex-spark"
+        assert kwargs["model_config"]["provider"] == "openai-codex"
+        assert kwargs["model_config"]["api_mode"] == "codex_responses"
+        assert "api_key" not in kwargs["model_config"]
+
+    @pytest.mark.asyncio
+    async def test_create_session_with_model_only_resolves_against_current_provider(self, adapter):
+        """A bare model value should still become a real override, not a display-only DB field."""
+        adapter._session_db.get_session.return_value = {
+            "session_id": "sess_new",
+            "source": "webui",
+            "model": "moonshotai/kimi-k2.6",
+            "model_config": json.dumps({"model": "moonshotai/kimi-k2.6", "provider": "openrouter"}),
+        }
+        switch_result = SimpleNamespace(
+            success=True,
+            new_model="moonshotai/kimi-k2.6",
+            target_provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            provider_label="OpenRouter",
+            resolved_via_alias="",
+        )
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("hermes_cli.config.load_config", return_value={"model": {"default": "gpt-5.3-codex-spark", "provider": "openai-codex"}}), \
+                 patch("hermes_cli.model_switch.switch_model", return_value=switch_result):
+                resp = await cli.post("/api/sessions", json={"source": "webui", "model": "moonshotai/kimi-k2.6"})
+        assert resp.status == 200
+        kwargs = adapter._session_db.create_session.call_args.kwargs
+        assert kwargs["model"] == "moonshotai/kimi-k2.6"
+        assert kwargs["model_config"]["provider"] == "openrouter"
 
     @pytest.mark.asyncio
     async def test_create_session_invalid_json(self, adapter):
@@ -369,6 +438,54 @@ class TestUpdateSession:
                 headers={"Content-Type": "application/json"},
             )
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_update_model_override(self, adapter):
+        adapter._session_db.get_session.return_value = {
+            "session_id": "sess_upd",
+            "model": "gpt-5.3-codex-spark",
+            "model_config": json.dumps({
+                "model": "gpt-5.3-codex-spark",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            }),
+        }
+        switch_result = SimpleNamespace(
+            success=True,
+            new_model="gpt-5.3-codex-spark",
+            target_provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+            provider_label="OpenAI Codex",
+            resolved_via_alias="",
+        )
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("hermes_cli.config.load_config", return_value={"model": {"default": "kimi-k2.6", "provider": "openrouter"}}), \
+                 patch("hermes_cli.model_switch.switch_model", return_value=switch_result):
+                resp = await cli.patch(
+                    "/api/sessions/sess_upd",
+                    json={"model": "gpt-5.3-codex-spark", "provider": "openai-codex"},
+                )
+        assert resp.status == 200
+        model, model_config = adapter._session_db.update_session_model.call_args.args[1:3]
+        assert model == "gpt-5.3-codex-spark"
+        assert model_config["provider"] == "openai-codex"
+        assert model_config["api_mode"] == "codex_responses"
+        assert "api_key" not in model_config
+
+    @pytest.mark.asyncio
+    async def test_clear_model_override(self, adapter):
+        adapter._session_db.get_session.return_value = {
+            "session_id": "sess_upd",
+            "model": None,
+            "model_config": None,
+        }
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.patch("/api/sessions/sess_upd", json={"model_config": None})
+        assert resp.status == 200
+        adapter._session_db.update_session_model.assert_called_with("sess_upd", None, None)
 
 
 class TestDeleteSession:
@@ -846,6 +963,39 @@ class TestAvailableModels:
                 assert resp.status == 200
                 # Should use config provider "openai"
                 mock_curated.assert_called_once_with("openai")
+
+    def test_context_windows_are_provider_aware(self):
+        """API model-picker context display should share agent metadata logic.
+
+        The old local static table reported GPT-5.5 as 128k for every provider,
+        while the agent resolver knows direct OpenAI/OpenRouter is 1.05M and
+        Codex OAuth is capped lower.
+        """
+        from api_server.handlers.config import _get_model_context_window
+
+        assert _get_model_context_window("openai/gpt-5.5", provider="openrouter") == 1_050_000
+        assert _get_model_context_window("gpt-5.5", provider="openai") == 1_050_000
+        assert _get_model_context_window("gpt-5.5", provider="openai-codex") == 272_000
+
+    @pytest.mark.asyncio
+    async def test_available_models_passes_provider_to_context_resolver(self, adapter):
+        """Endpoint output must not fall back to a provider-agnostic 128k table."""
+        from api_server.handlers.config import invalidate_models_cache
+
+        invalidate_models_cache()
+        mock_config = {"model": {"default": "openai/gpt-5.5", "provider": "openrouter"}}
+        mock_curated = [("openai/gpt-5.5", "GPT-5.5")]
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch("api_server.handlers.config.load_config", return_value=mock_config),
+                patch("api_server.handlers.config.curated_models_for_provider", return_value=mock_curated),
+                patch("api_server.handlers.config.list_available_providers", return_value=[]),
+            ):
+                resp = await cli.get("/api/available-models?provider=openrouter")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["models"][0]["context_window"] == 1_050_000
 
 
 # ---------------------------------------------------------------------------

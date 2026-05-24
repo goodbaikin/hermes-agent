@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 
 
+def _parse_bool_flag(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 async def handle_responses(
     request: web.Request,
     *,
@@ -53,7 +63,7 @@ async def handle_responses(
     instructions = body.get("instructions")
     previous_response_id = body.get("previous_response_id")
     conversation = body.get("conversation")
-    store = body.get("store", True)
+    store = _parse_bool_flag(body.get("store"), default=True)
 
     # conversation and previous_response_id are mutually exclusive
     if conversation and previous_response_id:
@@ -131,7 +141,7 @@ async def handle_responses(
     # Reuse session from previous_response_id chain
     session_id = stored_session_id or str(uuid.uuid4())
 
-    stream = bool(body.get("stream", False))
+    stream = _parse_bool_flag(body.get("stream"), default=False)
     if stream:
         _stream_q: _q.Queue = _q.Queue()
 
@@ -155,10 +165,21 @@ async def handle_responses(
                 }))
 
         def _on_tool_start(tool_call_id, function_name, function_args):
-            pass  # handled by _on_tool_progress
+            _stream_q.put(("__tool_started__", {
+                "tool_call_id": tool_call_id,
+                "name": function_name,
+                "arguments": function_args or {},
+            }))
 
         def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-            pass  # handled by _on_tool_progress
+            result_preview = function_result[:4000] if isinstance(function_result, str) else json.dumps(function_result, ensure_ascii=False)[:4000]
+            _stream_q.put(("__tool_completed__", {
+                "tool_call_id": tool_call_id,
+                "name": function_name,
+                "arguments": function_args or {},
+                "result": function_result,
+                "result_preview": result_preview,
+            }))
 
         agent_ref = [None]
         agent_task = asyncio.ensure_future(adapter._run_agent(
@@ -173,6 +194,7 @@ async def handle_responses(
             tool_complete_callback=_on_tool_complete,
             agent_ref=agent_ref,
         ))
+        agent_task.add_done_callback(lambda _task: _stream_q.put(None))
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         model_name = body.get("model", adapter._model_name)

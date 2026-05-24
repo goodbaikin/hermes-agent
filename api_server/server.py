@@ -112,11 +112,22 @@ class ResponseStore:
         # Evict oldest entries beyond max_size
         count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
         if count > self._max_size:
+            evicted_rows = self._conn.execute(
+                "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
+                (count - self._max_size,),
+            ).fetchall()
+            evicted_ids = [row[0] for row in evicted_rows]
             self._conn.execute(
                 "DELETE FROM responses WHERE response_id IN "
                 "(SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?)",
                 (count - self._max_size,),
             )
+            if evicted_ids:
+                placeholders = ",".join("?" for _ in evicted_ids)
+                self._conn.execute(
+                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+                    evicted_ids,
+                )
         self._conn.commit()
 
     def delete(self, response_id: str) -> bool:
@@ -124,6 +135,10 @@ class ResponseStore:
         cursor = self._conn.execute(
             "DELETE FROM responses WHERE response_id = ?", (response_id,)
         )
+        if cursor.rowcount > 0:
+            self._conn.execute(
+                "DELETE FROM conversations WHERE response_id = ?", (response_id,)
+            )
         self._conn.commit()
         return cursor.rowcount > 0
 
@@ -393,6 +408,74 @@ class StandaloneAPIServer:
         from api_server.utils import _build_user_content as _build
         return _build(text, attachments)
 
+    def _shutdown_cached_agent(self, agent: Any) -> None:
+        if agent is None:
+            return
+        if hasattr(agent, "memory_manager") and agent.memory_manager is not None:
+            try:
+                agent.memory_manager.shutdown_all()
+            except Exception:
+                pass
+
+    def _agent_cache_signature(self, model: str, runtime_kwargs: Dict[str, Any], profile: Optional[str]) -> tuple:
+        """Build a non-secret signature for deciding whether a cached agent is reusable."""
+        return (
+            model or "",
+            runtime_kwargs.get("provider") or "",
+            runtime_kwargs.get("base_url") or "",
+            runtime_kwargs.get("api_mode") or "",
+            runtime_kwargs.get("command") or "",
+            tuple(runtime_kwargs.get("args") or []),
+            profile or "",
+        )
+
+    @staticmethod
+    def _parse_session_model_config(raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _resolve_session_model_override(self, session: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Resolve a stored session model_config into AIAgent runtime kwargs.
+
+        The DB stores only non-secret provider metadata. Credentials are resolved
+        fresh at agent creation time so API keys never leak into session rows.
+        """
+        if not session:
+            return None
+        config = self._parse_session_model_config(session.get("model_config"))
+        model = str(config.get("model") or session.get("model") or "").strip()
+        provider = str(config.get("provider") or "").strip()
+        base_url = str(config.get("base_url") or "").strip()
+        api_mode = str(config.get("api_mode") or "").strip()
+        if not (model and (provider or base_url or api_mode)):
+            return None
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=provider or None,
+            explicit_base_url=base_url or None,
+            target_model=model,
+        )
+        override = {
+            "model": model,
+            "api_key": runtime.get("api_key"),
+            "base_url": base_url or runtime.get("base_url"),
+            "provider": runtime.get("provider") or provider,
+            "api_mode": api_mode or runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+        }
+        return {key: value for key, value in override.items() if value is not None}
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -416,24 +499,6 @@ class StandaloneAPIServer:
         subsequent requests to the same session. This avoids rebuilding tool
         schemas, memory providers, and LLM clients on every request.
         """
-        # Return cached agent for this session if available and config matches
-        if session_id:
-            cached = self._session_agent_cache.get(session_id)
-            if cached is not None:
-                # Update callbacks (they may differ per request)
-                if stream_delta_callback:
-                    cached.stream_delta_callback = stream_delta_callback
-                if tool_progress_callback:
-                    cached.tool_progress_callback = tool_progress_callback
-                if tool_start_callback:
-                    cached.tool_start_callback = tool_start_callback
-                if tool_complete_callback:
-                    cached.tool_complete_callback = tool_complete_callback
-                # Update ephemeral system prompt if provided
-                if ephemeral_system_prompt is not None:
-                    cached.ephemeral_system_prompt = ephemeral_system_prompt
-                return cached
-
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
         from hermes_cli.tools_config import _get_platform_tools
@@ -441,6 +506,50 @@ class StandaloneAPIServer:
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
+        session = None
+        db = self._ensure_session_db()
+
+        # If profile not explicitly provided, try to resolve from session DB.
+        # At the same time, pick up any session-scoped model override.
+        if session_id:
+            try:
+                if db is not None:
+                    session = db.get_session(session_id)
+                    if profile is None and session:
+                        profile = session.get("profile")
+            except Exception:
+                session = None
+
+        try:
+            override = self._resolve_session_model_override(session)
+            if override:
+                model = override.pop("model", model) or model
+                runtime_kwargs.update(override)
+        except Exception as exc:
+            logger.warning("Failed to resolve session model override for %s: %s", session_id, exc)
+
+        cache_signature = self._agent_cache_signature(model, runtime_kwargs, profile)
+
+        # Return cached agent for this session if available and config matches.
+        if session_id:
+            cached = self._session_agent_cache.get(session_id)
+            if cached is not None:
+                if getattr(cached, "_api_server_cache_signature", None) == cache_signature:
+                    # Update callbacks (they may differ per request)
+                    if stream_delta_callback:
+                        cached.stream_delta_callback = stream_delta_callback
+                    if tool_progress_callback:
+                        cached.tool_progress_callback = tool_progress_callback
+                    if tool_start_callback:
+                        cached.tool_start_callback = tool_start_callback
+                    if tool_complete_callback:
+                        cached.tool_complete_callback = tool_complete_callback
+                    # Update ephemeral system prompt if provided
+                    if ephemeral_system_prompt is not None:
+                        cached.ephemeral_system_prompt = ephemeral_system_prompt
+                    return cached
+                self._session_agent_cache.pop(session_id, None)
+                self._shutdown_cached_agent(cached)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -450,17 +559,6 @@ class StandaloneAPIServer:
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
-
-        # If profile not explicitly provided, try to resolve from session DB
-        if profile is None and session_id:
-            try:
-                db = self._ensure_session_db()
-                if db is not None:
-                    session = db.get_session(session_id)
-                    if session:
-                        profile = session.get("profile")
-            except Exception:
-                pass
 
         agent = AIAgent(
             model=model,
@@ -477,11 +575,12 @@ class StandaloneAPIServer:
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
-            session_db=self._ensure_session_db(),
+            session_db=db,
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             profile=profile,
         )
+        agent._api_server_cache_signature = cache_signature
 
         if session_id:
             self._session_agent_cache[session_id] = agent
@@ -584,11 +683,24 @@ class StandaloneAPIServer:
     async def _handle_update_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} -- update a session."""
         from api_server.handlers.sessions import handle_update_session
-        return await handle_update_session(
+        session_id = request.match_info.get("session_id", "")
+        response = await handle_update_session(
             request,
             check_auth=self._check_auth,
             ensure_session_db=self._ensure_session_db,
         )
+        if response.status == 200:
+            db = self._ensure_session_db()
+            resolved = session_id
+            try:
+                if db is not None:
+                    resolved = db.resolve_session_id(session_id) or session_id
+            except Exception:
+                pass
+            for cache_key in {session_id, resolved}:
+                agent = self._session_agent_cache.pop(cache_key, None)
+                self._shutdown_cached_agent(agent)
+        return response
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id} -- delete a session."""

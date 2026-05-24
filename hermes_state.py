@@ -745,6 +745,25 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def update_session_model(
+        self,
+        session_id: str,
+        model: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Set or clear a session-scoped model override."""
+        config_json = json.dumps(model_config) if model_config else None
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
+                (model, config_json, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):

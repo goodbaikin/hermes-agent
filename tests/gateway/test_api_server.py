@@ -301,6 +301,64 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
+    def test_create_agent_uses_session_model_override(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        session_db = MagicMock()
+        session_db.get_session.return_value = {
+            "id": "sess-codex",
+            "model": "gpt-5.3-codex-spark",
+            "model_config": json.dumps({
+                "model": "gpt-5.3-codex-spark",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            }),
+        }
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "or-key",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "moonshotai/kimi-k2.6")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: None),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **_: {
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "codex-key",
+                "api_mode": "codex_responses",
+                "args": [],
+            },
+        )
+
+        adapter = StandaloneAPIServer(PlatformConfig(enabled=True))
+        adapter._session_db = session_db
+
+        agent = adapter._create_agent(session_id="sess-codex")
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["model"] == "gpt-5.3-codex-spark"
+        assert captured["provider"] == "openai-codex"
+        assert captured["api_key"] == "codex-key"
+        assert captured["api_mode"] == "codex_responses"
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
@@ -766,8 +824,8 @@ class TestChatCompletionsEndpoint:
                         )
                     ),
                 ),
-                patch("gateway.platforms.api_server.asyncio.ensure_future", side_effect=_fake_ensure_future),
-                patch.object(adapter, "_write_sse_chat_completion", new_callable=AsyncMock) as mock_write_sse,
+                patch("api_server.handlers.chat_completions.asyncio.ensure_future", side_effect=_fake_ensure_future),
+                patch("api_server.handlers.chat_completions.write_sse_chat_completion", new_callable=AsyncMock) as mock_write_sse,
             ):
                 mock_write_sse.return_value = web.Response(status=200, text="ok")
                 resp = await cli.post(
@@ -790,7 +848,7 @@ class TestChatCompletionsEndpoint:
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
         """Idle SSE streams should send keepalive comments while tools run silently."""
         import asyncio
-        import api_server.server as api_server_mod
+        import api_server.handlers.chat_completions as chat_completions_mod
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -806,7 +864,7 @@ class TestChatCompletionsEndpoint:
                 )
 
             with (
-                patch.object(api_server_mod, "CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS", 0.01),
+                patch.object(chat_completions_mod, "CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS", 0.01),
                 patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
             ):
                 resp = await cli.post(
@@ -1867,8 +1925,8 @@ class TestResponsesStreaming:
                         )
                     ),
                 ),
-                patch("gateway.platforms.api_server.asyncio.ensure_future", side_effect=_fake_ensure_future),
-                patch.object(adapter, "_write_sse_responses", new_callable=AsyncMock) as mock_write_sse,
+                patch("api_server.handlers.responses.asyncio.ensure_future", side_effect=_fake_ensure_future),
+                patch("api_server.handlers.responses.write_sse_responses", new_callable=AsyncMock) as mock_write_sse,
             ):
                 mock_write_sse.return_value = web.Response(status=200, text="ok")
                 resp = await cli.post(

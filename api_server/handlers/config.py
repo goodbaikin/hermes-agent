@@ -124,7 +124,11 @@ async def _get_cached_models(provider: str) -> dict[str, Any]:
         return result
     # Refresh cache for this provider
     models = [
-        {"id": model_id, "description": description, "context_window": _get_model_context_window(model_id)}
+        {
+            "id": model_id,
+            "description": description,
+            "context_window": _get_model_context_window(model_id, provider=provider),
+        }
         for model_id, description in curated_models_for_provider(provider)
     ]
     providers = _get_cached_providers()
@@ -160,10 +164,11 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-sonnet-4-5-20250929": 200000,
     "claude-sonnet-4-20250514": 200000,
     "claude-haiku-4-5-20251001": 200000,
-    # OpenAI
-    "gpt-5-5": 128000,
-    "gpt-5-4": 128000,
-    "gpt-5-4-mini": 128000,
+    # OpenAI direct/API aggregator fallback values. Provider-specific caps
+    # (notably openai-codex) are resolved through agent.model_metadata first.
+    "gpt-5-5": 1050000,
+    "gpt-5-4": 1050000,
+    "gpt-5-4-mini": 400000,
     "gpt-5-3-codex": 200000,
     "gpt-5-2-codex": 200000,
     "gpt-5-mini": 128000,
@@ -210,10 +215,22 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 
-def _get_model_context_window(model_id: str) -> int:
-    """Return approximate context window for a model ID, or 128000 as fallback."""
+def _get_model_context_window(model_id: str, provider: str = "") -> int:
+    """Return provider-aware context window for a model ID, or 128000 as fallback."""
     if not model_id:
         return 128000
+    try:
+        from agent.model_metadata import get_model_context_length
+        resolved = get_model_context_length(
+            model_id,
+            provider=provider or None,
+            base_url="",
+            api_key="",
+        )
+        if resolved:
+            return int(resolved)
+    except Exception:
+        pass
     raw = model_id.strip().lower().replace("_", "-").replace(".", "-")
     # Exact match
     if raw in _MODEL_CONTEXT_WINDOWS:

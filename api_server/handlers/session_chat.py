@@ -14,6 +14,33 @@ logger = logging.getLogger(__name__)
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 15
 
 
+def _effective_session_model(session: Dict[str, Any], body: Optional[Dict[str, Any]] = None) -> str:
+    body = body or {}
+    cfg = session.get("model_config") if isinstance(session, dict) else None
+    if isinstance(cfg, str) and cfg.strip():
+        try:
+            cfg = json.loads(cfg)
+        except json.JSONDecodeError:
+            cfg = None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return str(body.get("model") or cfg.get("model") or session.get("model") or "hermes-agent")
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Coerce usage counters to JSON-safe ints; MagicMock/test doubles become 0."""
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return default
+
+
 async def handle_session_chat(
     request: web.Request,
     *,
@@ -55,7 +82,7 @@ async def handle_session_chat(
     if isinstance(user_content, list):
         logger.debug("[chat] Built multimodal content with %d parts", len(user_content))
 
-    model = body.get("model") or session.get("model") or "hermes-agent"
+    model = _effective_session_model(session, body)
     system_message = body.get("system_message")
     history = db.get_messages_as_conversation(session_id)
     loop = asyncio.get_event_loop()
@@ -73,9 +100,9 @@ async def handle_session_chat(
             persist_user_message=persist_text,
         )
         usage = {
-            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+            "input_tokens": _safe_int(getattr(agent, "session_prompt_tokens", 0)),
+            "output_tokens": _safe_int(getattr(agent, "session_completion_tokens", 0)),
+            "total_tokens": _safe_int(getattr(agent, "session_total_tokens", 0)),
         }
         return result, usage
 
@@ -242,6 +269,7 @@ async def handle_session_chat_stream(
             _queue_event("tool.progress", payload)
 
     agent_ref = [None]
+    completed_tool_call_ids = set()
     loop = asyncio.get_event_loop()
 
     def _make_tool_complete_callback(run_id, loop):
@@ -249,6 +277,8 @@ async def handle_session_chat_stream(
         def _callback(tool_call_id, tool_name, args, function_result):
             logger.info("[TOOL COMPLETE CALLBACK] tool_call_id=%s tool_name=%s", tool_call_id, tool_name)
             try:
+                if tool_call_id:
+                    completed_tool_call_ids.add(tool_call_id)
                 result_preview = ""
                 is_error = False
                 if isinstance(function_result, dict):
@@ -373,6 +403,33 @@ async def handle_session_chat_stream(
             except Exception:
                 pass
 
+        # Some test doubles and older agent paths return tool-call transcripts
+        # without invoking the live tool_complete_callback. Backfill missing
+        # tool.completed events from the final message list, but do not double-fire
+        # calls already seen through the callback path.
+        try:
+            tool_lookup = _tool_map(result.get("messages") or [])
+            for item in result.get("messages") or []:
+                if item.get("role") != "tool":
+                    continue
+                tool_call_id = item.get("tool_call_id") or ""
+                if tool_call_id and tool_call_id in completed_tool_call_ids:
+                    continue
+                meta = tool_lookup.get(tool_call_id, {})
+                await response.write(_encode_sse("tool.completed", {
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "tool": item.get("tool_name") or meta.get("tool_name") or "tool",
+                    "tool_name": item.get("tool_name") or meta.get("tool_name") or "tool",
+                    "tool_call_id": tool_call_id,
+                    "result_preview": _result_preview(item.get("content", ""), limit=4000),
+                    "is_error": False,
+                }))
+                if tool_call_id:
+                    completed_tool_call_ids.add(tool_call_id)
+        except Exception:
+            logger.debug("Failed to backfill tool.completed SSE events", exc_info=True)
+
         # Auto-generate session title after first exchange (synchronous — HTTP request/response)
         try:
             from agent.title_generator import auto_title_session
@@ -407,13 +464,16 @@ async def handle_session_chat_stream(
                 # Use last_prompt_tokens (current turn) instead of session_prompt_tokens (cumulative)
                 last_prompt = 0
                 try:
-                    last_prompt = getattr(agent.context_compressor, "last_prompt_tokens", 0) or 0
+                    compressor = getattr(agent, "context_compressor", None)
+                    last_prompt = _safe_int(getattr(compressor, "last_prompt_tokens", 0))
                 except Exception:
-                    last_prompt = getattr(agent, "session_prompt_tokens", 0) or 0
+                    last_prompt = _safe_int(getattr(agent, "session_prompt_tokens", 0))
+                if not last_prompt:
+                    last_prompt = _safe_int(getattr(agent, "session_prompt_tokens", 0))
                 usage = {
                     "input_tokens": last_prompt,
-                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                    "output_tokens": _safe_int(getattr(agent, "session_completion_tokens", 0)),
+                    "total_tokens": _safe_int(getattr(agent, "session_total_tokens", 0)),
                 }
                 logger.info("[session_chat] Agent usage for %s: input=%s output=%s total=%s",
                            session_id, usage["input_tokens"], usage["output_tokens"], usage["total_tokens"])

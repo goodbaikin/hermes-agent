@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 
 
+def _parse_stream_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 async def handle_chat_completions(
     request: web.Request,
     *,
@@ -61,7 +69,7 @@ async def handle_chat_completions(
             "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1},
         })
 
-    stream = body.get("stream", False)
+    stream = _parse_stream_flag(body.get("stream", False))
 
     # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
     system_prompt = None
@@ -174,7 +182,28 @@ async def handle_chat_completions(
                 }))
 
         def _on_tool_start(tool_call_id, function_name, function_args):
-            pass  # handled by _on_tool_progress
+            if not tool_call_id or str(function_name).startswith("_"):
+                return
+            _started_tool_call_ids.add(tool_call_id)
+            from agent.display import build_tool_preview, get_tool_emoji
+            label = build_tool_preview(function_name, function_args) or function_name
+            _stream_q.put(("__tool_progress__", {
+                "tool": function_name,
+                "emoji": get_tool_emoji(function_name),
+                "label": label,
+                "toolCallId": tool_call_id,
+                "status": "running",
+            }))
+
+        def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            if not tool_call_id or tool_call_id not in _started_tool_call_ids:
+                return
+            _started_tool_call_ids.discard(tool_call_id)
+            _stream_q.put(("__tool_progress__", {
+                "tool": function_name,
+                "toolCallId": tool_call_id,
+                "status": "completed",
+            }))
 
         agent_ref = [None]
         agent_task = asyncio.ensure_future(adapter._run_agent(
@@ -185,8 +214,10 @@ async def handle_chat_completions(
             stream_delta_callback=_on_delta,
             tool_progress_callback=_on_tool_progress,
             tool_start_callback=_on_tool_start,
+            tool_complete_callback=_on_tool_complete,
             agent_ref=agent_ref,
         ))
+        agent_task.add_done_callback(lambda _task: _stream_q.put(None))
 
         return await write_sse_chat_completion(
             request, completion_id, model_name, created, _stream_q,
