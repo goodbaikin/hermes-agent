@@ -73,6 +73,9 @@ async def handle_update_config(request: web.Request, *, check_auth) -> web.Respo
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
+    # Invalidate models cache so next fetch reflects new provider
+    invalidate_models_cache()
+
     current = _current_model_settings(config)
     return web.json_response({
         "ok": True,
@@ -87,26 +90,63 @@ import time
 import asyncio
 
 # Cache for available-models to avoid repeated slow API calls
-_models_cache: dict[str, Any] | None = None
-_models_cache_at: float = 0.0
+# Keyed by provider name so switching providers doesn't serve stale data
+_models_cache: dict[str, dict[str, Any]] = {}
+_models_cache_at: dict[str, float] = {}
 _MODELS_CACHE_TTL: float = 86400.0  # 24 hours
+
+# Separate cache for providers list (it's the slow part — 6s for auth checks)
+_providers_cache: list[dict[str, str]] | None = None
+_providers_cache_at: float = 0.0
+_PROVIDERS_CACHE_TTL: float = 86400.0  # 24 hours — auth status rarely changes
+
+
+def _get_cached_providers() -> list[dict[str, str]]:
+    """Return cached provider list (expensive auth check, 24h TTL)."""
+    global _providers_cache, _providers_cache_at
+    now = time.monotonic()
+    if _providers_cache is not None and (now - _providers_cache_at) < _PROVIDERS_CACHE_TTL:
+        return _providers_cache
+    _providers_cache = list_available_providers()
+    _providers_cache_at = now
+    return _providers_cache
 
 
 async def _get_cached_models(provider: str) -> dict[str, Any]:
-    """Return cached model list, refreshing in background if stale."""
+    """Return cached model list for a provider, refreshing if stale."""
     global _models_cache, _models_cache_at
     now = time.monotonic()
-    if _models_cache is not None and (now - _models_cache_at) < _MODELS_CACHE_TTL:
-        return _models_cache
-    # Refresh cache
+    cache_key = (provider or "").strip() or "default"
+    if cache_key in _models_cache and (now - _models_cache_at.get(cache_key, 0)) < _MODELS_CACHE_TTL:
+        # Return cached models + fresh provider list (providers are cached separately)
+        result = dict(_models_cache[cache_key])
+        result["providers"] = _get_cached_providers()
+        return result
+    # Refresh cache for this provider
     models = [
         {"id": model_id, "description": description, "context_window": _get_model_context_window(model_id)}
         for model_id, description in curated_models_for_provider(provider)
     ]
-    providers = list_available_providers()
-    _models_cache = {"provider": provider, "models": models, "providers": providers}
-    _models_cache_at = now
-    return _models_cache
+    providers = _get_cached_providers()
+    result = {"provider": provider, "models": models, "providers": providers}
+    _models_cache[cache_key] = {"provider": provider, "models": models, "providers": providers}
+    _models_cache_at[cache_key] = now
+    return result
+
+
+def invalidate_models_cache(provider: str = None):
+    """Invalidate models cache (called when provider/model config changes)."""
+    global _models_cache, _models_cache_at, _providers_cache, _providers_cache_at
+    if provider:
+        cache_key = (provider or "").strip() or "default"
+        _models_cache.pop(cache_key, None)
+        _models_cache_at.pop(cache_key, None)
+    else:
+        _models_cache.clear()
+        _models_cache_at.clear()
+    # Also invalidate providers cache (auth may have changed)
+    _providers_cache = None
+    _providers_cache_at = 0.0
 
 
 # Model ID → context window (approximate, in tokens)
