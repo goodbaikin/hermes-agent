@@ -145,7 +145,8 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
             return json.dumps(result, ensure_ascii=False)
 
         elif tool_name == "patch":
-            if params.get("mode") == "replace":
+            patch_mode = params.get("mode", "replace")
+            if patch_mode == "replace":
                 node_lib.node_patch(node_id, params["path"], [
                     {"old": params["old_string"], "new": params.get("new_string", "")}
                 ])
@@ -160,10 +161,23 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
                     from agent.lsp.remote_client import format_diagnostics
                     result["lsp_diagnostics"] = format_diagnostics(lsp_diags, params["path"])
                 return json.dumps(result, ensure_ascii=False)
+            elif patch_mode == "patch":
+                patch_text = params.get("patch")
+                if not isinstance(patch_text, str):
+                    return json.dumps({"error": "Patch content must be a string"}, ensure_ascii=False)
+                if not patch_text.strip():
+                    return json.dumps({"error": "Patch content is required"}, ensure_ascii=False)
+                result = node_lib.node_patch_v4a(
+                    node_id,
+                    patch_text,
+                    base_dir=_get_workspace_workdir(),
+                )
+                payload = result.get("payload", {})
+                return json.dumps(payload, ensure_ascii=False)
             else:
-                return json.dumps({"error": "V4A patch not supported on remote"})
-
+                return json.dumps({"error": f"Unsupported patch mode: {patch_mode}"}, ensure_ascii=False)
         elif tool_name == "search_files":
+
             entries = node_lib.node_search(
                 node_id, pattern=params.get("pattern", ""),
                 path=params.get("path", "."),

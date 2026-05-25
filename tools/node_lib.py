@@ -124,6 +124,15 @@ def node_patch(node_id: str, path: str, changes: List[Dict[str, Any]]) -> Dict[s
     return node_write(node_id, path, text)
 
 
+def node_patch_v4a(node_id: str, patch: str, base_dir: str | None = None) -> Dict[str, Any]:
+    """Apply a V4A patch payload to files on a node."""
+    params: Dict[str, Any] = {"patch": patch}
+    if base_dir:
+        params["base_dir"] = base_dir
+    result_str = node_invoke(node_id, "file.patch", params)
+    return _parse_result(result_str)
+
+
 def node_lsp_lint(node_id: str, path: str, content: str, workspace_root: str = None) -> List[Dict[str, Any]]:
     """Run LSP diagnostics on a file after write/patch.
 
