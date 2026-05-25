@@ -1135,6 +1135,25 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+
+    # Inherit workspace selection from the parent agent so child tool calls
+    # route to the same remote workspace. Without this, contextvars in the
+    # delegated thread default to local unless the child's _workspace is set.
+    inherited_workspace = getattr(parent_agent, "_workspace", None)
+    if isinstance(inherited_workspace, str) and inherited_workspace.strip():
+        child._workspace = inherited_workspace.strip()
+    else:
+        # Fallback to parent thread workspace context (covering any custom
+        # per-turn workspace propagation paths).
+        try:
+            from agent.workspace_context import get_workspace
+
+            _ws = get_workspace()
+            if isinstance(_ws, str) and _ws.strip():
+                child._workspace = _ws.strip()
+        except Exception:
+            pass
+
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth

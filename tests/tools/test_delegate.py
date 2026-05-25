@@ -1529,6 +1529,48 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             ["web", "browser"],
         )
 
+    def test_build_child_agent_inherits_parent_workspace_from_agent(self):
+        parent = _make_mock_parent()
+        parent._workspace = "ws-remote"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test workspace inheritance",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(mock_child._workspace, "ws-remote")
+
+    @patch("agent.workspace_context.get_workspace", return_value="ctx-workspace")
+    def test_build_child_agent_inherits_parent_workspace_from_context(self, mock_get_workspace):
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test workspace context inheritance",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(mock_child._workspace, "ctx-workspace")
+
 
 class TestChildCredentialLeasing(unittest.TestCase):
     def test_run_single_child_acquires_and_releases_lease(self):
