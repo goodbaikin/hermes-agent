@@ -167,11 +167,24 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
                     return json.dumps({"error": "Patch content must be a string"}, ensure_ascii=False)
                 if not patch_text.strip():
                     return json.dumps({"error": "Patch content is required"}, ensure_ascii=False)
-                result = node_lib.node_patch_v4a(
-                    node_id,
-                    patch_text,
-                    base_dir=_get_workspace_workdir(),
-                )
+                try:
+                    result = node_lib.node_patch_v4a(
+                        node_id,
+                        patch_text,
+                        base_dir=_get_workspace_workdir(),
+                    )
+                except RuntimeError as exc:
+                    message = str(exc)
+                    if "Node operation failed" in message and "file.patch" in message.lower():
+                        return json.dumps({
+                            "error": (
+                                "Remote V4A patch failed on this node. "
+                                "If this is an older node, fallback to replace mode "
+                                "or run the same patch locally."
+                            )
+                        }, ensure_ascii=False)
+                    return json.dumps({"error": f"Remote patch failed on {node_id}: {message}"}, ensure_ascii=False)
+
                 payload = result.get("payload", {})
                 return json.dumps(payload, ensure_ascii=False)
             else:

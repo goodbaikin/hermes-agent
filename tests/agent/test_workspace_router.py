@@ -63,3 +63,22 @@ def test_route_tool_call_patch_unsupported_mode_returns_error():
     result = json.loads(result_json)
     assert "error" in result
     assert result["error"] == "Unsupported patch mode: other"
+
+
+def test_route_tool_call_patch_v4a_node_patch_not_supported_returns_advice():
+    with patch("agent.workspace_router.should_route_to_node", return_value="node-legacy"), patch(
+        "tools.node_lib.node_patch_v4a", side_effect=RuntimeError("Node operation failed: unknown action file.patch")
+    ):
+        result_json = workspace_router.route_tool_call("patch", {
+            "mode": "patch",
+            "patch": "*** Begin Patch\n*** Add File: foo.txt\n+hello\n*** End Patch",
+        })
+
+    payload = json.loads(result_json)
+    assert payload == {
+        "error": (
+            "Remote V4A patch failed on this node. "
+            "If this is an older node, fallback to replace mode "
+            "or run the same patch locally."
+        )
+    }
