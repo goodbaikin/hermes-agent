@@ -75,6 +75,59 @@ def _ra():
     return run_agent
 
 
+def estimate_request_context_tokens(api_payload: Any) -> int:
+    """Estimate context/load tokens from an API payload, dict or messages list.
+
+    The stale-call detectors historically assumed a Chat Completions request:
+    they pulled ``api_kwargs["messages"]`` and ran a cheap char/4 estimate.
+    Codex / Responses API requests carry the conversational payload in
+    ``input`` (with additional load in ``instructions`` and ``tools``), so the
+    legacy estimator reported ~0 tokens for every Codex turn and the
+    context-tier scaling never fired.
+
+    This helper handles both shapes:
+      - bare list -> treat as Chat Completions ``messages``
+      - dict with ``messages`` -> Chat Completions (+ ``tools`` if present)
+      - dict with ``input`` -> Responses API (+ ``instructions``/``tools``)
+      - any other dict -> fall back to summing string values
+    """
+
+    def _chars(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            return len(value)
+        return len(str(value))
+
+    def _message_chars(messages: Any) -> int:
+        if not isinstance(messages, list):
+            return _chars(messages)
+        return sum(_chars(item) for item in messages)
+
+    if isinstance(api_payload, list):
+        return _message_chars(api_payload) // 4
+
+    if isinstance(api_payload, dict):
+        messages = api_payload.get("messages")
+        if isinstance(messages, list):
+            total_chars = _message_chars(messages)
+            if "tools" in api_payload:
+                total_chars += _chars(api_payload.get("tools"))
+            return total_chars // 4
+
+        if "input" in api_payload:
+            total_chars = (
+                _chars(api_payload.get("input"))
+                + _chars(api_payload.get("instructions"))
+                + _chars(api_payload.get("tools"))
+            )
+            return total_chars // 4
+
+        return sum(_chars(value) for value in api_payload.values()) // 4
+
+    return _chars(api_payload) // 4
+
+
 
 def interruptible_api_call(agent, api_kwargs: dict):
     """
@@ -91,18 +144,62 @@ def interruptible_api_call(agent, api_kwargs: dict):
     provider fallback.
     """
     result = {"response": None, "error": None}
-    request_client_holder = {"client": None}
+    request_client_holder = {"client": None, "owner_tid": None}
+    request_client_lock = threading.Lock()
+
+    def _set_request_client(client):
+        with request_client_lock:
+            request_client_holder["client"] = client
+            # #29507: stamp the owning thread so a stranger-thread interrupt
+            # only shuts the connection down rather than racing the worker
+            # for FD ownership during ``client.close()``.
+            request_client_holder["owner_tid"] = threading.get_ident()
+        return client
+
+    def _close_request_client_once(reason: str) -> None:
+        # #29507: dispatch on the calling thread.
+        #
+        # When ``_call`` (the worker) reaches its ``finally`` it owns the
+        # close and we pop + fully close as before. When a *stranger* thread
+        # (the interrupt-check loop, the stale-call detector) drives the
+        # close, only shut the sockets down so the worker's blocked
+        # ``recv``/``send`` unwinds with an ``EPIPE`` / EOF — and let the
+        # worker close ``client`` from its own thread on its way out. That
+        # avoids the FD-recycling race where the kernel reassigned a
+        # just-closed TLS socket FD to ``kanban.db``, and the still-live SSL
+        # BIO on the worker thread then wrote a 24-byte TLS application-data
+        # record into the SQLite header (#29507).
+        with request_client_lock:
+            request_client = request_client_holder.get("client")
+            owner_tid = request_client_holder.get("owner_tid")
+            stranger_thread = (
+                request_client is not None
+                and owner_tid is not None
+                and owner_tid != threading.get_ident()
+            )
+            if not stranger_thread:
+                # Owning thread (or no recorded owner) → pop and fully close.
+                request_client_holder["client"] = None
+                request_client_holder["owner_tid"] = None
+        if request_client is None:
+            return
+        if stranger_thread:
+            agent._abort_request_openai_client(request_client, reason=reason)
+        else:
+            agent._close_request_openai_client(request_client, reason=reason)
 
     def _call():
         try:
             if agent.api_mode == "codex_responses":
-                request_client_holder["client"] = agent._create_request_openai_client(
-                    reason="codex_stream_request",
-                    api_kwargs=api_kwargs,
+                request_client = _set_request_client(
+                    agent._create_request_openai_client(
+                        reason="codex_stream_request",
+                        api_kwargs=api_kwargs,
+                    )
                 )
                 result["response"] = agent._run_codex_stream(
                     api_kwargs,
-                    client=request_client_holder["client"],
+                    client=request_client,
                     on_first_delta=getattr(agent, "_codex_on_first_delta", None),
                 )
             elif agent.api_mode == "anthropic_messages":
@@ -131,17 +228,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     raise
                 result["response"] = normalize_converse_response(raw_response)
             else:
-                request_client_holder["client"] = agent._create_request_openai_client(
-                    reason="chat_completion_request",
-                    api_kwargs=api_kwargs,
+                request_client = _set_request_client(
+                    agent._create_request_openai_client(
+                        reason="chat_completion_request",
+                        api_kwargs=api_kwargs,
+                    )
                 )
-                result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+                result["response"] = request_client.chat.completions.create(**api_kwargs)
         except Exception as e:
             result["error"] = e
         finally:
-            request_client = request_client_holder.get("client")
-            if request_client is not None:
-                agent._close_request_openai_client(request_client, reason="request_complete")
+            _close_request_client_once("request_complete")
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
     # Non-streaming calls return nothing until the full response is
@@ -149,9 +246,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(
-        api_kwargs.get("messages", [])
-    )
+    _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -175,7 +270,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # arrives within the configured timeout.
         _elapsed = time.time() - _call_start
         if _elapsed > _stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                 "model=%s context=~%s tokens. Killing connection.",
@@ -192,9 +287,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     agent._anthropic_client.close()
                     agent._rebuild_anthropic_client()
                 else:
-                    rc = request_client_holder.get("client")
-                    if rc is not None:
-                        agent._close_request_openai_client(rc, reason="stale_call_kill")
+                    _close_request_client_once("stale_call_kill")
             except Exception:
                 pass
             agent._touch_activity(
@@ -218,9 +311,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     agent._anthropic_client.close()
                     agent._rebuild_anthropic_client()
                 else:
-                    request_client = request_client_holder.get("client")
-                    if request_client is not None:
-                        agent._close_request_openai_client(request_client, reason="interrupt_abort")
+                    _close_request_client_once("interrupt_abort")
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
@@ -315,6 +406,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             max_tokens=agent.max_tokens,
+            timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
@@ -1916,7 +2008,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # when the context is large.  Without this, the stale detector kills
         # healthy connections during the model's thinking phase, producing
         # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+        _est_tokens = estimate_request_context_tokens(api_kwargs)
         if _est_tokens > 100_000:
             _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
         elif _est_tokens > 50_000:
@@ -1952,7 +2044,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",
