@@ -376,6 +376,28 @@ class TestGetSessionMessages:
             assert resp.status == 200
             adapter._session_db.ensure_session.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_get_messages_include_lineage_returns_parent_and_child_messages(self, adapter):
+        """Compression continuations must render as one logical transcript."""
+        adapter._session_db.get_session.return_value = {"session_id": "child", "parent_session_id": "parent"}
+        adapter._session_db._session_lineage_root_to_tip.return_value = ["parent", "child"]
+
+        def _messages(session_id, limit=None, offset=0, order="asc"):
+            return {
+                "parent": [{"id": 1, "session_id": "parent", "role": "user", "content": "before compression", "timestamp": 1}],
+                "child": [{"id": 2, "session_id": "child", "role": "assistant", "content": "after compression", "timestamp": 2}],
+            }.get(session_id, [])
+
+        adapter._session_db.get_messages.side_effect = _messages
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/sessions/child/messages?include_lineage=true")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["total"] == 2
+            assert [m["content"] for m in data["items"]] == ["before compression", "after compression"]
+            assert data["lineage"] == ["parent", "child"]
+
 
 class TestUpdateSession:
     @pytest.mark.asyncio
@@ -1215,6 +1237,49 @@ class TestSessionChat:
                 assert "run_id" in data
                 assert "usage" in data
                 assert data["usage"]["input_tokens"] == 100
+                adapter._session_db.get_messages_as_conversation.assert_called_with(
+                    "sess_chat", include_ancestors=True
+                )
+
+    @pytest.mark.asyncio
+    async def test_session_chat_returns_rotated_compression_session_id(self, adapter):
+        """Sync chat must follow the agent's live session after compression rotation."""
+        adapter._session_db.get_session.return_value = {
+            "session_id": "parent",
+            "title": "Compressed Chat",
+            "source": "api_server",
+            "model": "hermes-agent",
+        }
+        adapter._session_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "before compression"},
+        ]
+
+        mock_agent = MagicMock()
+        mock_agent.session_id = "child"
+        mock_agent.run_conversation.return_value = {
+            "final_response": "continued",
+            "completed": True,
+            "partial": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+        mock_agent.session_prompt_tokens = 10
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 12
+
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post("/api/sessions/parent/chat", json={"message": "続き"})
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["session_id"] == "child"
+        assert data["continued_from"] == "parent"
+        adapter._session_db.get_messages_as_conversation.assert_called_with(
+            "parent", include_ancestors=True
+        )
 
     @pytest.mark.asyncio
     async def test_session_chat_missing_message(self, adapter):
@@ -1335,6 +1400,62 @@ class TestSessionChatStream:
                 assert "sess_stream" in body
                 # Verify final response content
                 assert "Streamed response!" in body
+                adapter._session_db.get_messages_as_conversation.assert_called_with(
+                    "sess_stream", include_ancestors=True
+                )
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_continuation_session_created_after_compression_rotation(self, adapter):
+        """Streaming chat must tell WebUI to switch to #2 after compression."""
+        def _get_session(session_id):
+            if session_id == "child":
+                return {
+                    "session_id": "child",
+                    "id": "child",
+                    "title": "Compressed Chat #2",
+                    "parent_session_id": "parent",
+                }
+            return {
+                "session_id": "parent",
+                "id": "parent",
+                "title": "Compressed Chat",
+                "source": "api_server",
+                "model": "hermes-agent",
+            }
+
+        adapter._session_db.get_session.side_effect = _get_session
+        adapter._session_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "before compression"},
+        ]
+
+        mock_agent = MagicMock()
+        mock_agent.session_id = "child"
+        mock_agent.run_conversation.return_value = {
+            "final_response": "continued",
+            "completed": True,
+            "partial": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+        mock_agent.session_prompt_tokens = 10
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 12
+
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post("/api/sessions/parent/chat/stream", json={"message": "続き"})
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert body.count("event: session.created") >= 2
+        assert '"session_id": "child"' in body
+        assert '"parent_session_id": "parent"' in body
+        assert '"session_id": "child", "run_id"' in body
+        adapter._session_db.get_messages_as_conversation.assert_called_with(
+            "parent", include_ancestors=True
+        )
 
     @pytest.mark.asyncio
     async def test_stream_missing_message(self, adapter):

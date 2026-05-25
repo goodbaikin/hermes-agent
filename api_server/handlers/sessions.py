@@ -58,6 +58,37 @@ def _clean_model_config(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _query_bool(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lineage_ids(db: Any, session_id: str) -> list[str]:
+    if not session_id:
+        return []
+    if hasattr(db, "_session_lineage_root_to_tip"):
+        try:
+            ids = db._session_lineage_root_to_tip(session_id)
+            if ids:
+                return list(ids)
+        except Exception:
+            logger.debug("Failed to resolve session lineage for %s", session_id, exc_info=True)
+    return [session_id]
+
+
+def _messages_for_lineage(db: Any, session_id: str, order: str = "asc") -> tuple[list[Dict[str, Any]], list[str]]:
+    ids = _lineage_ids(db, session_id)
+    items: list[Dict[str, Any]] = []
+    for sid in ids:
+        try:
+            items.extend(db.get_messages(sid, order="asc"))
+        except Exception:
+            logger.debug("Failed to load lineage messages for %s", sid, exc_info=True)
+    items.sort(key=lambda msg: (msg.get("timestamp") or 0, msg.get("id") or 0))
+    if order == "desc":
+        items.reverse()
+    return items, ids
+
+
 def _resolve_session_model_config(body: Dict[str, Any], current_session: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """Resolve a PATCH/POST body into a safe session model override.
 
@@ -333,18 +364,29 @@ async def handle_get_session_messages(request: web.Request, *, check_auth, ensur
         limit = _parse_int(request.query.get("limit"), None)
         offset = _parse_int(request.query.get("offset"), 0)
         order = request.query.get("order", "asc")  # "asc" | "desc"
+        include_lineage = _query_bool(request.query.get("include_lineage"))
         t_db = time.time()
-        items = db.get_messages(resolved, limit=limit, offset=offset, order=order)
+        if include_lineage:
+            all_items, lineage = _messages_for_lineage(db, resolved, order=order)
+            total = len(all_items)
+            items = all_items[offset:]
+            if limit is not None:
+                items = items[:limit]
+        else:
+            lineage = None
+            items = db.get_messages(resolved, limit=limit, offset=offset, order=order)
+            total = db.message_count(resolved) if hasattr(db, 'message_count') else len(items)
         t_items = time.time()
-        # Get total count for pagination info
-        total = db.message_count(resolved) if hasattr(db, 'message_count') else len(items)
         t_total = time.time()
         elapsed = (t_total - t_start) * 1000
         db_elapsed = (t_items - t_db) * 1000
         count_elapsed = (t_total - t_items) * 1000
         if elapsed > 50:
             logger.warning(f"[SLOW MSG] session={resolved} total={elapsed:.0f}ms db={db_elapsed:.0f}ms count={count_elapsed:.0f}ms items={len(items)} limit={limit}")
-        return web.json_response({"items": items, "total": total, "limit": limit, "offset": offset})
+        payload = {"items": items, "total": total, "limit": limit, "offset": offset}
+        if include_lineage:
+            payload["lineage"] = lineage
+        return web.json_response(payload)
     except Exception as e:
         logger.exception("Error getting session messages")
         return web.json_response({"error": str(e)}, status=500)

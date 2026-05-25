@@ -1388,9 +1388,11 @@ class SessionDB:
                 # surface the tip's identity and activity data.
                 merged = dict(s)
                 for key in (
-                    "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "preview",
-                    "model", "system_prompt",
+                    "id", "source", "user_id", "parent_session_id", "profile",
+                    "ended_at", "end_reason", "message_count",
+                    "tool_call_count", "input_tokens", "output_tokens",
+                    "current_prompt_tokens", "title", "last_active", "preview",
+                    "model", "model_config", "system_prompt",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]

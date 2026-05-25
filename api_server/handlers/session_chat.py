@@ -41,6 +41,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
     return default
 
 
+def _agent_session_id(agent: Any, fallback: str) -> str:
+    """Return the live agent session id after compression rotation, if known."""
+    try:
+        current = getattr(agent, "session_id", None)
+    except Exception:
+        current = None
+    return current if isinstance(current, str) and current else fallback
+
+
 async def handle_session_chat(
     request: web.Request,
     *,
@@ -84,7 +93,7 @@ async def handle_session_chat(
 
     model = _effective_session_model(session, body)
     system_message = body.get("system_message")
-    history = db.get_messages_as_conversation(session_id)
+    history = db.get_messages_as_conversation(session_id, include_ancestors=True)
     loop = asyncio.get_event_loop()
 
     def _run():
@@ -99,23 +108,25 @@ async def handle_session_chat(
             conversation_history=history,
             persist_user_message=persist_text,
         )
+        actual_session_id = _agent_session_id(agent, session_id)
         usage = {
             "input_tokens": _safe_int(getattr(agent, "session_prompt_tokens", 0)),
             "output_tokens": _safe_int(getattr(agent, "session_completion_tokens", 0)),
             "total_tokens": _safe_int(getattr(agent, "session_total_tokens", 0)),
         }
-        return result, usage
+        return result, usage, actual_session_id
 
     try:
         import contextvars
         ctx = contextvars.copy_context()
-        result, usage = await loop.run_in_executor(None, ctx.run, _run)
+        result, usage, actual_session_id = await loop.run_in_executor(None, ctx.run, _run)
     except Exception as e:
         logger.error("Error running session chat for %s: %s", session_id, e, exc_info=True)
         return web.json_response({"error": str(e)}, status=500)
 
     return web.json_response({
-        "session_id": session_id,
+        "session_id": actual_session_id,
+        "continued_from": session_id if actual_session_id != session_id else None,
         "run_id": f"run_{uuid.uuid4().hex}",
         "model": model,
         "final_response": result.get("final_response"),
@@ -174,7 +185,7 @@ async def handle_session_chat_stream(
         logger.debug("[chat/stream] Built multimodal content with %d parts", len(user_content))
 
     system_message = body.get("system_message")
-    history = db.get_messages_as_conversation(session_id)
+    history = db.get_messages_as_conversation(session_id, include_ancestors=True)
     assistant_message_id = f"msg_asst_{uuid.uuid4().hex}"
 
     # Note: user message persistence is handled by AIAgent._flush_messages_to_session_db
@@ -403,6 +414,31 @@ async def handle_session_chat_stream(
             except Exception:
                 pass
 
+        agent = agent_ref[0]
+        actual_session_id = _agent_session_id(agent, session_id)
+        if actual_session_id != session_id:
+            try:
+                rotated_session = normalize_session_record(db.get_session(actual_session_id)) or {
+                    "id": actual_session_id,
+                    "session_id": actual_session_id,
+                    "title": session.get("title") or "New Chat",
+                    "parent_session_id": session_id,
+                }
+            except Exception:
+                rotated_session = {
+                    "id": actual_session_id,
+                    "session_id": actual_session_id,
+                    "title": session.get("title") or "New Chat",
+                    "parent_session_id": session_id,
+                }
+            await response.write(_encode_sse("session.created", {
+                "session_id": actual_session_id,
+                "run_id": run_id,
+                "title": rotated_session.get("title") or "New Chat",
+                "parent_session_id": rotated_session.get("parent_session_id") or session_id,
+                "session": rotated_session,
+            }))
+
         # Some test doubles and older agent paths return tool-call transcripts
         # without invoking the live tool_complete_callback. Backfill missing
         # tool.completed events from the final message list, but do not double-fire
@@ -445,12 +481,12 @@ async def handle_session_chat_stream(
                     user_msg = str(user_msg).strip()
             auto_title_session(
                 session_db=db,
-                session_id=session_id,
+                session_id=actual_session_id,
                 user_message=user_msg,
                 assistant_response=assistant_response,
             )
         except Exception:
-            logger.debug("Auto-title failed for session %s", session_id, exc_info=True)
+            logger.debug("Auto-title failed for session %s", actual_session_id, exc_info=True)
 
         # Build usage from agent result
         usage = {
@@ -476,22 +512,22 @@ async def handle_session_chat_stream(
                     "total_tokens": _safe_int(getattr(agent, "session_total_tokens", 0)),
                 }
                 logger.info("[session_chat] Agent usage for %s: input=%s output=%s total=%s",
-                           session_id, usage["input_tokens"], usage["output_tokens"], usage["total_tokens"])
+                           actual_session_id, usage["input_tokens"], usage["output_tokens"], usage["total_tokens"])
                 # Save current prompt tokens to session DB for context gauge
                 try:
                     db._execute_write(lambda conn: conn.execute(
                         "UPDATE sessions SET current_prompt_tokens = ? WHERE id = ?",
-                        (last_prompt, session_id)
+                        (last_prompt, actual_session_id)
                     ))
                     logger.info("[session_chat] Saved current_prompt_tokens=%s for session %s",
-                               last_prompt, session_id)
+                               last_prompt, actual_session_id)
                 except Exception as e:
                     logger.error("[session_chat] Failed to save current_prompt_tokens: %s", e)
         except Exception as e:
             logger.error("[session_chat] Error building usage: %s", e)
 
         await response.write(_encode_sse("assistant.completed", {
-            "session_id": session_id,
+            "session_id": actual_session_id,
             "run_id": run_id,
             "message_id": assistant_message_id,
             "content": result.get("final_response") or "",
@@ -500,7 +536,7 @@ async def handle_session_chat_stream(
             "interrupted": result.get("interrupted", False),
         }))
         await response.write(_encode_sse("run.completed", {
-            "session_id": session_id,
+            "session_id": actual_session_id,
             "run_id": run_id,
             "message_id": assistant_message_id,
             "completed": result.get("completed", False),
@@ -509,7 +545,7 @@ async def handle_session_chat_stream(
             "api_calls": result.get("api_calls"),
             "usage": usage,
         }))
-        await response.write(_encode_sse("done", {"session_id": session_id, "run_id": run_id, "state": "final"}))
+        await response.write(_encode_sse("done", {"session_id": actual_session_id, "run_id": run_id, "state": "final"}))
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         agent = agent_ref[0]
         if agent is not None:
