@@ -175,7 +175,13 @@ def run_codex_app_server_turn(
 
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta: callable = None,
+    on_stream_activity: callable = None,
+):
     """Execute one streaming Responses API request and return the final response."""
     import httpx as _httpx
 
@@ -198,6 +204,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     if agent._interrupt_requested:
                         break
                     event_type = getattr(event, "type", "")
+                    if on_stream_activity:
+                        try:
+                            on_stream_activity(event_type)
+                        except Exception:
+                            pass
                     # Fire callbacks on text content deltas (suppress during tool calls)
                     if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                         delta_text = getattr(event, "delta", "")
@@ -280,7 +291,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 agent._client_log_context(),
                 exc,
             )
-            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            return agent._run_codex_create_stream_fallback(
+                api_kwargs,
+                client=active_client,
+                on_stream_activity=on_stream_activity,
+            )
         except RuntimeError as exc:
             err_text = str(exc)
             missing_completed = "response.completed" in err_text
@@ -327,12 +342,21 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(),
                     err_text,
                 )
-                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                return agent._run_codex_create_stream_fallback(
+                    api_kwargs,
+                    client=active_client,
+                    on_stream_activity=on_stream_activity,
+                )
             raise
 
 
 
-def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):
+def run_codex_create_stream_fallback(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_stream_activity: callable = None,
+):
     """Fallback path for stream completion edge cases on Codex-style Responses backends."""
     active_client = client or agent._ensure_primary_openai_client(reason="codex_create_stream_fallback")
     fallback_kwargs = dict(api_kwargs)
@@ -355,6 +379,11 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             event_type = getattr(event, "type", None)
             if not event_type and isinstance(event, dict):
                 event_type = event.get("type")
+            if on_stream_activity:
+                try:
+                    on_stream_activity(event_type)
+                except Exception:
+                    pass
 
             # ``error`` SSE frames carry the provider's real failure
             # reason (subscription / quota / model-not-available /

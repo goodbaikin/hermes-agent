@@ -146,6 +146,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
     result = {"response": None, "error": None}
     request_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
+    stream_activity = {"seen": False, "last": None, "event_type": None}
+    stream_activity_lock = threading.Lock()
+
+    def _mark_stream_activity(event_type: str | None = None) -> None:
+        with stream_activity_lock:
+            stream_activity["seen"] = True
+            stream_activity["last"] = time.time()
+            stream_activity["event_type"] = event_type
+
+    def _stream_idle_elapsed(now: float) -> tuple[bool, float | None, str | None]:
+        with stream_activity_lock:
+            if not stream_activity["seen"] or stream_activity["last"] is None:
+                return False, None, None
+            return True, now - float(stream_activity["last"]), stream_activity.get("event_type")
 
     def _set_request_client(client):
         with request_client_lock:
@@ -201,6 +215,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     api_kwargs,
                     client=request_client,
                     on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+                    on_stream_activity=_mark_stream_activity,
                 )
             elif agent.api_mode == "anthropic_messages":
                 result["response"] = agent._anthropic_messages_create(api_kwargs)
@@ -266,22 +281,40 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
             )
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        _elapsed = time.time() - _call_start
-        if _elapsed > _stale_timeout:
+        # Stale-call detector: kill the connection if no response arrives
+        # within the configured timeout. Codex Responses streams internally;
+        # once stream events are flowing, treat the timeout as an idle timeout
+        # from the most recent event instead of a fixed wall-clock cap from
+        # request start.
+        _now = time.time()
+        _elapsed = _now - _call_start
+        _has_stream_activity, _stream_idle, _last_stream_event = _stream_idle_elapsed(_now)
+        _stale_elapsed = _stream_idle if _has_stream_activity and _stream_idle is not None else _elapsed
+        if _stale_elapsed > _stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
-            logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
-                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-            )
-            agent._emit_status(
-                f"⚠️ No response from provider for {int(_elapsed)}s "
-                f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                f"Aborting call."
-            )
+            if _has_stream_activity:
+                logger.warning(
+                    "Codex Responses stream idle for %.0fs (threshold %.0fs, total %.0fs). "
+                    "model=%s context=~%s tokens last_event=%s. Killing connection.",
+                    _stale_elapsed, _stale_timeout, _elapsed,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}", _last_stream_event,
+                )
+                agent._emit_status(
+                    f"⚠️ Codex stream was idle for {int(_stale_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}). Aborting call."
+                )
+            else:
+                logger.warning(
+                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _elapsed, _stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
+                agent._emit_status(
+                    f"⚠️ No response from provider for {int(_elapsed)}s "
+                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Aborting call."
+                )
             try:
                 if agent.api_mode == "anthropic_messages":
                     agent._anthropic_client.close()
