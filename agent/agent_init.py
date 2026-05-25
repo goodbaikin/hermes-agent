@@ -62,6 +62,81 @@ from utils import base_url_host_matches
 logger = logging.getLogger("run_agent")
 
 
+def _non_empty_text(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        value = value.strip()
+        if value:
+            return value
+    return None
+
+
+def _workspace_from_config(config: Dict[str, Any]) -> Optional[str]:
+    """Return configured workspace name, accepting both old and new keys."""
+    if not isinstance(config, dict):
+        return None
+    return _non_empty_text(config.get("active_workspace")) or _non_empty_text(config.get("workspace"))
+
+
+def _load_yaml_config(path: Path) -> Dict[str, Any]:
+    try:
+        import yaml
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _resolve_active_profile(explicit_profile: Optional[str]) -> Optional[str]:
+    explicit = _non_empty_text(explicit_profile)
+    if explicit:
+        return explicit
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return _non_empty_text(get_active_profile_name())
+    except Exception:
+        return None
+
+
+def _resolve_active_workspace(explicit_workspace: Optional[str], profile: Optional[str]) -> Optional[str]:
+    """Resolve per-agent workspace without mutating global WorkspaceManager state."""
+    explicit = _non_empty_text(explicit_workspace)
+    if explicit:
+        return explicit
+
+    configs: list[Dict[str, Any]] = []
+    if profile:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            profile_dir = get_profile_dir(profile)
+            if profile_dir:
+                configs.append(_load_yaml_config(Path(profile_dir) / "config.yaml"))
+        except Exception:
+            pass
+
+    try:
+        configs.append(_load_yaml_config(Path(get_hermes_home()) / "config.yaml"))
+    except Exception:
+        pass
+
+    for cfg in configs:
+        workspace_name = _workspace_from_config(cfg)
+        if workspace_name:
+            return workspace_name
+
+    try:
+        from agent.workspace_manager import get_workspace_manager
+        active_name = _non_empty_text(get_workspace_manager().active_name)
+        if active_name and active_name != "default":
+            return active_name
+    except Exception:
+        pass
+    return None
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -138,6 +213,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     profile: str = None,
+    workspace: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -200,7 +276,9 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
+    profile = _resolve_active_profile(profile)
     agent.profile = profile  # Active profile name (e.g. "csharp-eng")
+    agent._workspace = _resolve_active_workspace(workspace, profile)
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_name = user_name
     agent._chat_id = chat_id
@@ -1506,36 +1584,6 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
-
-    # Activate workspace from profile if provided
-    # Store on agent for per-session isolation via contextvars in run_conversation.
-    # Do NOT touch the global WorkspaceManager singleton here — concurrent
-    # sessions (API Server) would clobber each other's active workspace.
-    agent._workspace = None
-    if profile:
-        try:
-            # Load profile-specific config to get active_workspace
-            from hermes_cli.profiles import get_profile_dir
-            profile_dir = get_profile_dir(profile)
-            if profile_dir:
-                import yaml
-                config_path = profile_dir / "config.yaml"
-                if config_path.exists():
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        profile_config = yaml.safe_load(f) or {}
-                    active_ws = profile_config.get("active_workspace")
-                    if active_ws:
-                        agent._workspace = active_ws
-                        _ra().logger.info("Workspace '%s' resolved from profile '%s'", active_ws, profile)
-                    else:
-                        _ra().logger.debug("No active_workspace in profile '%s' config", profile)
-                else:
-                    _ra().logger.debug("No config.yaml found for profile '%s'", profile)
-            else:
-                _ra().logger.warning("Profile directory not found for '%s'", profile)
-        except Exception as e:
-            _ra().logger.debug("Failed to resolve workspace from profile '%s': %s", profile, e)
-
 
 
 __all__ = ["init_agent"]

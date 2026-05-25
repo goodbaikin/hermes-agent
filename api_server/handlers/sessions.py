@@ -369,6 +369,7 @@ async def handle_fork_session(request: web.Request, *, check_auth, ensure_sessio
             system_prompt=original.get("system_prompt"),
             user_id=original.get("user_id"),
             parent_session_id=session_id,
+            profile=original.get("profile"),
         )
         messages = db.get_messages(session_id)
         for message in messages:
