@@ -925,9 +925,37 @@ class AIAgent:
 
         from agent.chat_completion_helpers import estimate_request_context_tokens
         est_tokens = estimate_request_context_tokens(api_payload)
+        is_chatgpt_codex = (
+            getattr(self, "provider", "") == "openai-codex"
+            or "chatgpt.com/backend-api/codex" in base_url.lower()
+        )
+        payload_model = str(
+            api_payload.get("model", "") if isinstance(api_payload, dict) else ""
+        )
+        effective_model = payload_model or getattr(self, "model", "") or ""
+        is_gpt5_codex = is_chatgpt_codex and self._model_requires_responses_api(effective_model)
+
+        if is_gpt5_codex and est_tokens > 10_000:
+            # ChatGPT's Codex backend can stay completely silent before the
+            # first SSE frame, especially once Hermes sends a real agent turn
+            # with tools/skills/history.  The old 600s "legacy grace" still
+            # kills healthy GPT-5.5 runs around ~70k context, before
+            # ``response.created`` ever appears.  For this backend, let the
+            # underlying request timeout be the first-event ceiling; after any
+            # SSE event arrives, ``interruptible_api_call`` switches to the
+            # normal idle-timeout path and still catches genuinely stalled
+            # streams.
+            return max(stale_base, self._resolved_api_call_timeout())
         if est_tokens > 100_000:
+            # Keep the lower #31967 ceiling for non-ChatGPT providers.
+            if is_chatgpt_codex:
+                return max(stale_base, self._resolved_api_call_timeout())
             return max(stale_base, 240.0)
         if est_tokens > 50_000:
+            # Real ChatGPT Codex runs still hit first-event stalls in the
+            # 50k-100k band; generic providers keep the shorter ceiling.
+            if is_chatgpt_codex:
+                return max(stale_base, self._resolved_api_call_timeout())
             return max(stale_base, 150.0)
         return stale_base
 
