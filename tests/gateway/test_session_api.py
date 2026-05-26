@@ -1465,6 +1465,49 @@ class TestSessionChatStream:
                     "sess_stream", include_ancestors=True
                 )
 
+
+    @pytest.mark.asyncio
+    async def test_stream_failed_agent_result_emits_run_failed(self, adapter):
+        """Streaming chat must surface retry/fallback exhaustion as run.failed."""
+        adapter._session_db.get_session.return_value = {
+            "session_id": "sess_failed_stream",
+            "title": "Failed Stream",
+            "source": "api_server",
+        }
+        adapter._session_db.get_messages_as_conversation.return_value = []
+
+        mock_result = {
+            "final_response": "API call failed after 3 retries: provider timed out",
+            "completed": False,
+            "failed": True,
+            "error": "provider timed out",
+            "api_calls": 3,
+            "messages": [],
+        }
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = mock_result
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post(
+                    "/api/sessions/sess_failed_stream/chat/stream",
+                    json={"message": "Hello"},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert "event: assistant.completed" in body
+        assert '"failed": true' in body
+        assert '"error": "provider timed out"' in body
+        assert "event: run.failed" in body
+        assert "event: run.completed" not in body
+        assert "event: done" in body
+
     @pytest.mark.asyncio
     async def test_stream_emits_continuation_session_created_after_compression_rotation(self, adapter):
         """Streaming chat must tell WebUI to switch to #2 after compression."""

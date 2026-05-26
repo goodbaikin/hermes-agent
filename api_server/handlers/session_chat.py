@@ -441,7 +441,13 @@ async def handle_session_chat_stream(
             result = await agent_task
         except Exception as e:
             logger.error("[session_chat] Agent task failed: %s", e)
-            result = {"messages": [], "final_response": "", "completed": False}
+            result = {
+                "messages": [],
+                "final_response": "",
+                "completed": False,
+                "failed": True,
+                "error": str(e),
+            }
             # Signal SSE loop to terminate
             try:
                 stream_q.put(None)
@@ -560,25 +566,48 @@ async def handle_session_chat_stream(
         except Exception as e:
             logger.error("[session_chat] Error building usage: %s", e)
 
+        final_content = result.get("final_response") or ""
+        completed = bool(result.get("completed", False))
+        partial = bool(result.get("partial", False))
+        interrupted = bool(result.get("interrupted", False))
+        failed = bool(result.get("failed", False))
+        error_message = str(result.get("error") or final_content or "Agent run failed")
+
         await response.write(_encode_sse("assistant.completed", {
             "session_id": actual_session_id,
             "run_id": run_id,
             "message_id": assistant_message_id,
-            "content": result.get("final_response") or "",
-            "completed": result.get("completed", False),
-            "partial": result.get("partial", False),
-            "interrupted": result.get("interrupted", False),
+            "content": final_content,
+            "completed": completed,
+            "partial": partial,
+            "interrupted": interrupted,
+            "failed": failed,
+            "error": error_message if failed else None,
         }))
-        await response.write(_encode_sse("run.completed", {
-            "session_id": actual_session_id,
-            "run_id": run_id,
-            "message_id": assistant_message_id,
-            "completed": result.get("completed", False),
-            "partial": result.get("partial", False),
-            "interrupted": result.get("interrupted", False),
-            "api_calls": result.get("api_calls"),
-            "usage": usage,
-        }))
+        if failed and not interrupted:
+            await response.write(_encode_sse("run.failed", {
+                "session_id": actual_session_id,
+                "run_id": run_id,
+                "message_id": assistant_message_id,
+                "completed": completed,
+                "partial": partial,
+                "interrupted": interrupted,
+                "failed": True,
+                "error": error_message,
+                "api_calls": result.get("api_calls"),
+                "usage": usage,
+            }))
+        else:
+            await response.write(_encode_sse("run.completed", {
+                "session_id": actual_session_id,
+                "run_id": run_id,
+                "message_id": assistant_message_id,
+                "completed": completed,
+                "partial": partial,
+                "interrupted": interrupted,
+                "api_calls": result.get("api_calls"),
+                "usage": usage,
+            }))
         await response.write(_encode_sse("done", {"session_id": actual_session_id, "run_id": run_id, "state": "final"}))
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         agent = agent_ref[0]

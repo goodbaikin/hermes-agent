@@ -2703,6 +2703,18 @@ def run_conversation(
                 # provider/network failure (malformed response body,
                 # truncated stream, routing layer corruption), not a
                 # local programming bug, and should be retried (#14782).
+                # Exclude TypeErrors that originate from SDK stream parsing
+                # (e.g. 'NoneType' object is not iterable when
+                # responses.stream() returns a None iterator, or
+                # get_final_response() encounters unexpected None fields).
+                # These are transient backend/network issues, not local
+                # programming bugs, and should be retried.
+                _is_stream_parse_type_error = (
+                    isinstance(api_error, TypeError)
+                    and any(p in error_msg for p in (
+                        "nonetype", "is not iterable", "is not subscriptable",
+                    ))
+                )
                 is_local_validation_error = (
                     isinstance(api_error, (ValueError, TypeError))
                     and not isinstance(
@@ -2716,6 +2728,7 @@ def run_conversation(
                     # ssl.SSLError explicitly so the error classifier's
                     # retryable=True mapping takes effect instead.
                     and not isinstance(api_error, ssl.SSLError)
+                    and not _is_stream_parse_type_error
                 )
                 is_client_error = (
                     is_local_validation_error

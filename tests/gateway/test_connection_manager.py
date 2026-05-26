@@ -164,6 +164,56 @@ class TestSessionConnectionAgentRun:
         with pytest.raises(RuntimeError, match="already in progress"):
             await conn.start_agent_run("hello", None, None, None, None, None)
 
+
+    @pytest.mark.asyncio
+    async def test_failed_agent_result_emits_run_failed(self):
+        """Failed agent results must surface as errors, not silent completion."""
+        conn = SessionConnection("sess_failed")
+
+        class FakeDB:
+            def get_messages_as_conversation(self, session_id):
+                return []
+
+        class FakeAgent:
+            def __init__(self):
+                self._session_db = None
+
+            def run_conversation(self, *args, **kwargs):
+                return {
+                    "final_response": "API call failed after 3 retries: provider timed out",
+                    "completed": False,
+                    "failed": True,
+                    "error": "provider timed out",
+                    "api_calls": 0,
+                    "messages": [],
+                }
+
+        def create_agent_fn(**kwargs):
+            return FakeAgent()
+
+        def get_session_db_fn():
+            return FakeDB()
+
+        def build_user_content_fn(message, attachments):
+            return message, message
+
+        await conn.start_agent_run(
+            "hello", None, None,
+            create_agent_fn, get_session_db_fn, build_user_content_fn,
+        )
+
+        events = [(ev.event, ev.data) for ev in conn.get_events_since(0)]
+        event_names = [name for name, _ in events]
+        assert "assistant.completed" in event_names
+        assert "run.failed" in event_names
+        assert "run.completed" not in event_names
+
+        assistant_completed = next(data for name, data in events if name == "assistant.completed")
+        run_failed = next(data for name, data in events if name == "run.failed")
+        assert assistant_completed["failed"] is True
+        assert assistant_completed["error"] == "provider timed out"
+        assert run_failed["error"] == "provider timed out"
+
     @pytest.mark.asyncio
     async def test_interrupt_run_no_task(self):
         conn = SessionConnection("sess_1")

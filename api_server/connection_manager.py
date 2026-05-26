@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections import deque
 from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
@@ -313,24 +314,51 @@ class SessionConnection:
                 result = await agent_task
             except Exception as exc:
                 logger.error("[SessionConnection:%s] Agent run error: %s", session_id, exc)
-                result = {"messages": [], "final_response": "", "completed": False, "error": str(exc)}
+                result = {
+                    "messages": [],
+                    "final_response": "",
+                    "completed": False,
+                    "failed": True,
+                    "error": str(exc),
+                }
+
+            final_content = result.get("final_response") or ""
+            completed = bool(result.get("completed", False))
+            partial = bool(result.get("partial", False))
+            interrupted = bool(result.get("interrupted", False))
+            failed = bool(result.get("failed", False))
+            error_message = str(result.get("error") or final_content or "Agent run failed")
 
             await self.broadcast_event("assistant.completed", {
                 "session_id": session_id, "run_id": run_id,
                 "message_id": assistant_message_id,
-                "content": result.get("final_response") or "",
-                "completed": result.get("completed", False),
-                "partial": result.get("partial", False),
-                "interrupted": result.get("interrupted", False),
+                "content": final_content,
+                "completed": completed,
+                "partial": partial,
+                "interrupted": interrupted,
+                "failed": failed,
+                "error": error_message if failed else None,
             })
-            await self.broadcast_event("run.completed", {
-                "session_id": session_id, "run_id": run_id,
-                "message_id": assistant_message_id,
-                "completed": result.get("completed", False),
-                "partial": result.get("partial", False),
-                "interrupted": result.get("interrupted", False),
-                "api_calls": result.get("api_calls"),
-            })
+            if failed and not interrupted:
+                await self.broadcast_event("run.failed", {
+                    "session_id": session_id, "run_id": run_id,
+                    "message_id": assistant_message_id,
+                    "completed": completed,
+                    "partial": partial,
+                    "interrupted": interrupted,
+                    "failed": True,
+                    "error": error_message,
+                    "api_calls": result.get("api_calls"),
+                })
+            else:
+                await self.broadcast_event("run.completed", {
+                    "session_id": session_id, "run_id": run_id,
+                    "message_id": assistant_message_id,
+                    "completed": completed,
+                    "partial": partial,
+                    "interrupted": interrupted,
+                    "api_calls": result.get("api_calls"),
+                })
 
         except Exception as exc:
             logger.error("[SessionConnection:%s] Error in agent run handler: %s", session_id, exc)
