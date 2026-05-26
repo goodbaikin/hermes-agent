@@ -58,6 +58,9 @@ async def handle_session_chat(
     normalize_session_record,
     build_user_content,
     create_agent,
+    register_active_session_task=None,
+    register_active_session_agent=None,
+    unregister_active_session=None,
 ) -> web.Response:
     """POST /api/sessions/{session_id}/chat -- run a session-aware chat turn."""
     auth_err = check_auth(request)
@@ -103,6 +106,11 @@ async def handle_session_chat(
             profile=session.get("profile"),
         )
         agent._session_db = db  # Enable session persistence
+        if register_active_session_agent is not None:
+            try:
+                register_active_session_agent(session_id, agent)
+            except Exception:
+                logger.debug("Failed to register active session agent %s", session_id, exc_info=True)
         result = agent.run_conversation(
             user_content,
             conversation_history=history,
@@ -116,13 +124,26 @@ async def handle_session_chat(
         }
         return result, usage, actual_session_id
 
+    run_task = None
     try:
         import contextvars
         ctx = contextvars.copy_context()
-        result, usage, actual_session_id = await loop.run_in_executor(None, ctx.run, _run)
+        run_task = asyncio.ensure_future(loop.run_in_executor(None, ctx.run, _run))
+        if register_active_session_task is not None:
+            try:
+                register_active_session_task(session_id, run_task)
+            except Exception:
+                logger.debug("Failed to register active session task %s", session_id, exc_info=True)
+        result, usage, actual_session_id = await run_task
     except Exception as e:
         logger.error("Error running session chat for %s: %s", session_id, e, exc_info=True)
         return web.json_response({"error": str(e)}, status=500)
+    finally:
+        if unregister_active_session is not None:
+            try:
+                unregister_active_session(session_id, run_task)
+            except Exception:
+                logger.debug("Failed to unregister active session %s", session_id, exc_info=True)
 
     return web.json_response({
         "session_id": actual_session_id,
@@ -150,6 +171,9 @@ async def handle_session_chat_stream(
     build_user_content,
     create_agent,
     cors_headers_for_origin,
+    register_active_session_task=None,
+    register_active_session_agent=None,
+    unregister_active_session=None,
 ) -> web.StreamResponse:
     """POST /api/sessions/{session_id}/chat/stream -- stream a session chat turn over SSE."""
     auth_err = check_auth(request)
@@ -327,6 +351,11 @@ async def handle_session_chat_stream(
             )
             agent._session_db = db  # Enable session persistence
             agent_ref[0] = agent
+            if register_active_session_agent is not None:
+                try:
+                    register_active_session_agent(session_id, agent)
+                except Exception:
+                    logger.debug("Failed to register active session agent %s", session_id, exc_info=True)
             return agent.run_conversation(
                 user_content,
                 conversation_history=history,
@@ -338,6 +367,11 @@ async def handle_session_chat_stream(
         return await loop.run_in_executor(None, ctx.run, _run)
 
     agent_task = asyncio.ensure_future(_run_agent_task())
+    if register_active_session_task is not None:
+        try:
+            register_active_session_task(session_id, agent_task)
+        except Exception:
+            logger.debug("Failed to register active session task %s", session_id, exc_info=True)
 
     sse_headers = {
         "Content-Type": "text/event-stream",
@@ -566,5 +600,11 @@ async def handle_session_chat_stream(
         await response.write_eof()
     except Exception:
         pass
+    finally:
+        if unregister_active_session is not None:
+            try:
+                unregister_active_session(session_id, agent_task)
+            except Exception:
+                logger.debug("Failed to unregister active session %s", session_id, exc_info=True)
 
     return response

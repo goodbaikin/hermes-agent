@@ -213,6 +213,89 @@ class StandaloneAPIServer:
         # clients on every request (fixes unclosed aiohttp session leaks).
         self._session_agent_cache: Dict[str, Any] = {}
         self._session_agent_cache_lock = asyncio.Lock()
+        # Live session turns keyed by session_id. Used so DELETE /api/sessions/{id}
+        # can interrupt an in-flight chat turn and wait for it to stop before the
+        # backing DB row is removed; otherwise the agent may flush final messages
+        # after deletion and hit sqlite FOREIGN KEY failures.
+        self._active_session_tasks: Dict[str, asyncio.Task] = {}
+        self._active_session_agents: Dict[str, Any] = {}
+
+
+    def _register_active_session_task(
+        self,
+        session_id: Optional[str],
+        task: Optional[asyncio.Task],
+    ) -> None:
+        if session_id and task is not None:
+            self._active_session_tasks[session_id] = task
+
+
+    def _register_active_session_agent(
+        self,
+        session_id: Optional[str],
+        agent: Any,
+    ) -> None:
+        if session_id and agent is not None:
+            self._active_session_agents[session_id] = agent
+
+
+    def _unregister_active_session(
+        self,
+        session_id: Optional[str],
+        task: Optional[asyncio.Task] = None,
+    ) -> None:
+        if not session_id:
+            return
+        current_task = self._active_session_tasks.get(session_id)
+        if task is None or current_task is task:
+            self._active_session_tasks.pop(session_id, None)
+            self._active_session_agents.pop(session_id, None)
+
+
+    async def _stop_active_session(
+        self,
+        session_id: Optional[str],
+        *,
+        reason: str = "Session deleted",
+        wait_timeout: float = 2.0,
+    ) -> bool:
+        """Interrupt an in-flight session turn and wait for it to quiesce.
+
+        Returns True when no active turn exists or the active turn stopped
+        within ``wait_timeout``. Returns False when the turn is still running.
+        """
+        if not session_id:
+            return True
+
+        task = self._active_session_tasks.get(session_id)
+        agent = (
+            self._active_session_agents.get(session_id)
+            or self._session_agent_cache.get(session_id)
+        )
+
+        if agent is not None:
+            try:
+                agent.interrupt(reason)
+            except Exception:
+                logger.debug("Failed to interrupt active session %s", session_id, exc_info=True)
+
+        if task is None or task.done():
+            self._unregister_active_session(session_id, task)
+            return True
+
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait_timeout)
+        except asyncio.TimeoutError:
+            return False
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # The task may fail/cancel while unwinding after interrupt. That's
+            # fine — the important part is that it is no longer running.
+            pass
+
+        self._unregister_active_session(session_id, task)
+        return True
 
 
     @staticmethod
@@ -706,6 +789,15 @@ class StandaloneAPIServer:
         """DELETE /api/sessions/{session_id} -- delete a session."""
         from api_server.handlers.sessions import handle_delete_session
         session_id = request.match_info.get("session_id", "")
+        stopped = await self._stop_active_session(session_id, reason="Session deleted via API")
+        if not stopped:
+            return web.json_response(
+                {
+                    "error": "Session is still stopping; try deleting it again in a moment",
+                    "session_id": session_id,
+                },
+                status=409,
+            )
         response = await handle_delete_session(
             request,
             check_auth=self._check_auth,
@@ -741,6 +833,9 @@ class StandaloneAPIServer:
             normalize_session_record=self._normalize_session_record,
             build_user_content=self._build_user_content,
             create_agent=self._create_agent,
+            register_active_session_task=self._register_active_session_task,
+            register_active_session_agent=self._register_active_session_agent,
+            unregister_active_session=self._unregister_active_session,
         )
 
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
@@ -754,6 +849,9 @@ class StandaloneAPIServer:
             build_user_content=self._build_user_content,
             create_agent=self._create_agent,
             cors_headers_for_origin=self._cors_headers_for_origin,
+            register_active_session_task=self._register_active_session_task,
+            register_active_session_agent=self._register_active_session_agent,
+            unregister_active_session=self._unregister_active_session,
         )
 
     async def _handle_get_memory(self, request: "web.Request") -> "web.Response":

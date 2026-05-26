@@ -11,6 +11,7 @@ Tests cover:
 - Capability probe fast-path
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -528,6 +529,66 @@ class TestDeleteSession:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.delete("/api/sessions/sess_missing")
             assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_session_interrupts_active_turn_before_db_delete(self, adapter):
+        adapter._session_db.delete_session.return_value = True
+        stop_event = asyncio.Event()
+
+        mock_agent = MagicMock()
+
+        def _interrupt(_reason=None):
+            stop_event.set()
+
+        mock_agent.interrupt.side_effect = _interrupt
+        adapter._active_session_agents["sess_del"] = mock_agent
+
+        async def _running_turn():
+            await stop_event.wait()
+            return None
+
+        adapter._active_session_tasks["sess_del"] = asyncio.create_task(_running_turn())
+
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete("/api/sessions/sess_del")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["ok"] is True
+
+        mock_agent.interrupt.assert_called_once()
+        adapter._session_db.delete_session.assert_called_once_with("sess_del")
+        assert "sess_del" not in adapter._active_session_tasks
+        assert "sess_del" not in adapter._active_session_agents
+
+    @pytest.mark.asyncio
+    async def test_delete_session_returns_409_when_active_turn_wont_stop(self, adapter):
+        adapter._session_db.delete_session.return_value = True
+        mock_agent = MagicMock()
+        adapter._active_session_agents["sess_busy"] = mock_agent
+
+        async def _stuck_turn():
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(_stuck_turn())
+        adapter._active_session_tasks["sess_busy"] = task
+
+        app = _create_session_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.delete("/api/sessions/sess_busy")
+                assert resp.status == 409
+                data = await resp.json()
+                assert "still stopping" in data["error"]
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_agent.interrupt.assert_called_once()
+        adapter._session_db.delete_session.assert_not_called()
 
 
 class TestForkSession:
