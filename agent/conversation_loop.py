@@ -942,6 +942,7 @@ def run_conversation(
         oauth_1m_beta_retry_attempted = False
         llama_cpp_grammar_retry_attempted = False
         has_retried_429 = False
+        codex_no_first_byte_failures = 0
         restart_with_compressed_messages = False
         restart_with_length_continuation = False
 
@@ -2201,6 +2202,10 @@ def run_conversation(
                     )
 
                 retry_count += 1
+                if classified.reason == FailoverReason.provider_silent_hang:
+                    codex_no_first_byte_failures += 1
+                else:
+                    codex_no_first_byte_failures = 0
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
@@ -2271,6 +2276,23 @@ def run_conversation(
                         "completed": False,
                         "interrupted": True,
                     }
+
+                if classified.reason == FailoverReason.provider_silent_hang:
+                    if agent._fallback_index < len(agent._fallback_chain):
+                        agent._emit_status(
+                            "⚠️ Codex provider produced no first byte — switching to fallback provider..."
+                        )
+                        if agent._try_activate_fallback(reason=classified.reason):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            codex_no_first_byte_failures = 0
+                            continue
+                    if codex_no_first_byte_failures >= 2:
+                        agent._emit_status(
+                            "❌ Codex provider produced no first byte twice — failing fast."
+                        )
+                        retry_count = max_retries
                 
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
                 # A 413 is a payload-size error — the correct response is to

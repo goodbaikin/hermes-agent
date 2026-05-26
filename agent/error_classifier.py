@@ -38,6 +38,7 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    provider_silent_hang = "provider_silent_hang"  # Accepted request but emitted no first stream event
 
     # Context / payload
     context_overflow = "context_overflow"  # Context too large — compress, not failover
@@ -266,6 +267,12 @@ _TIMEOUT_MESSAGE_PATTERNS = [
     "deadline exceeded",
     "operation timed out",
     "upstream timed out",
+]
+
+_PROVIDER_SILENT_HANG_PATTERNS = [
+    "no first byte from provider",
+    "emitted no stream events",
+    "produced no bytes within ttfb cutoff",
 ]
 
 # Transport error type names
@@ -536,6 +543,17 @@ def classify_api_error(
         return _result(
             FailoverReason.auth,
             retryable=False,
+            should_fallback=True,
+        )
+
+    # Codex / Responses backends can accept a streaming request and then
+    # emit no first SSE event. Treat that differently from a generic network
+    # timeout so the retry loop can fail fast or move to fallback instead of
+    # burning the whole retry budget on identical first-byte stalls.
+    if any(p in error_msg for p in _PROVIDER_SILENT_HANG_PATTERNS):
+        return _result(
+            FailoverReason.provider_silent_hang,
+            retryable=True,
             should_fallback=True,
         )
 

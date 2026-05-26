@@ -147,6 +147,16 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
+        if is_codex_backend and str(model).strip().lower().startswith("gpt-5.5"):
+            # ChatGPT's Codex backend has intermittently accepted gpt-5.5
+            # requests and then emitted no first SSE event when it receives
+            # the public Responses reasoning/include/store knobs. The Codex
+            # surface infers its own storage/reasoning behavior, so keep this
+            # backend payload minimal for the affected model family.
+            kwargs.pop("reasoning", None)
+            kwargs.pop("include", None)
+            kwargs.pop("store", None)
+
         # Forward per-request timeout to the SDK so OpenAI/Anthropic clients
         # honor it.  Without this, ``providers.<id>.request_timeout_seconds``
         # is silently dropped on the main agent Codex path while the

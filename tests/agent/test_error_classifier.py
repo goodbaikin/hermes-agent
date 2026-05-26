@@ -54,6 +54,7 @@ class TestFailoverReason:
         expected = {
             "auth", "auth_permanent", "billing", "rate_limit",
             "overloaded", "server_error", "timeout",
+            "provider_silent_hang",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
             "provider_policy_blocked",
@@ -64,6 +65,20 @@ class TestFailoverReason:
         }
         actual = {r.value for r in FailoverReason}
         assert expected == actual
+
+    def test_codex_no_first_byte_is_provider_silent_hang(self):
+        err = TimeoutError(
+            "No first byte from provider in 45s (codex stream, model: gpt-5.5). "
+            "Backend accepted the request but emitted no stream events."
+        )
+        result = classify_api_error(
+            err,
+            provider="openai-codex",
+            model="gpt-5.5",
+        )
+        assert result.reason == FailoverReason.provider_silent_hang
+        assert result.retryable is True
+        assert result.should_fallback is True
 
 
 # ── Test: ClassifiedError ──────────────────────────────────────────────

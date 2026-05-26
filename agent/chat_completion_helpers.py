@@ -64,6 +64,10 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 
+class CodexNoFirstByteTimeout(TimeoutError):
+    """Codex Responses request accepted but emitted no first stream event."""
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -127,6 +131,18 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
 
     return _chars(api_payload) // 4
 
+
+def _codex_stream_ttfb_timeout(agent, stale_timeout: float) -> float:
+    """Return the no-first-byte cutoff for Codex's internally streamed path."""
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return stale_timeout
+    try:
+        configured = float(os.getenv("HERMES_CODEX_STREAM_TTFB_TIMEOUT", "20"))
+    except (TypeError, ValueError):
+        configured = 45.0
+    if configured <= 0:
+        return stale_timeout
+    return min(stale_timeout, configured)
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
@@ -262,6 +278,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
     _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
+    _ttfb_timeout = _codex_stream_ttfb_timeout(agent, _stale_timeout)
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -290,7 +307,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _elapsed = _now - _call_start
         _has_stream_activity, _stream_idle, _last_stream_event = _stream_idle_elapsed(_now)
         _stale_elapsed = _stream_idle if _has_stream_activity and _stream_idle is not None else _elapsed
-        if _stale_elapsed > _stale_timeout:
+        _active_timeout = _stale_timeout if _has_stream_activity else _ttfb_timeout
+        if _stale_elapsed > _active_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             if _has_stream_activity:
                 logger.warning(
@@ -304,17 +322,31 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"(model: {api_kwargs.get('model', 'unknown')}). Aborting call."
                 )
             else:
-                logger.warning(
-                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                    "model=%s context=~%s tokens. Killing connection.",
-                    _elapsed, _stale_timeout,
-                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-                )
-                agent._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Aborting call."
-                )
+                if agent.api_mode == "codex_responses":
+                    logger.warning(
+                        "Codex stream produced no bytes within TTFB cutoff "
+                        "(%.0fs > %.0fs, model=%s context=~%s tokens). "
+                        "Killing connection.",
+                        _elapsed, _active_timeout,
+                        api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    )
+                    agent._emit_status(
+                        f"⚠️ No first byte from provider in {int(_active_timeout)}s "
+                        f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Reconnecting."
+                    )
+                else:
+                    logger.warning(
+                        "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                        "model=%s context=~%s tokens. Killing connection.",
+                        _elapsed, _active_timeout,
+                        api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                    )
+                    agent._emit_status(
+                        f"⚠️ No response from provider for {int(_elapsed)}s "
+                        f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Aborting call."
+                    )
             try:
                 if agent.api_mode == "anthropic_messages":
                     agent._anthropic_client.close()
@@ -329,10 +361,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
-                    f"Non-streaming API call timed out after {int(_elapsed)}s "
-                    f"with no response (threshold: {int(_stale_timeout)}s)"
-                )
+                if agent.api_mode == "codex_responses" and not _has_stream_activity:
+                    result["error"] = CodexNoFirstByteTimeout(
+                        f"No first byte from provider in {int(_active_timeout)}s "
+                        f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Backend accepted the request but emitted no stream events."
+                    )
+                else:
+                    result["error"] = TimeoutError(
+                        f"Non-streaming API call timed out after {int(_elapsed)}s "
+                        f"with no response (threshold: {int(_active_timeout)}s)"
+                    )
             break
 
         if agent._interrupt_requested:

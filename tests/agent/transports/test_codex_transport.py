@@ -155,6 +155,32 @@ class TestCodexBuildKwargs:
         )
         assert "max_output_tokens" not in kw
 
+    def test_codex_backend_gpt55_sanitizes_silent_hang_prone_kwargs(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert "reasoning" not in kw
+        assert "include" not in kw
+        assert "store" not in kw
+
+    def test_codex_backend_gpt54_keeps_standard_responses_kwargs(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kw["store"] is False
+        assert kw["reasoning"]["effort"] == "high"
+        assert "reasoning.encrypted_content" in kw["include"]
+
     def test_xai_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

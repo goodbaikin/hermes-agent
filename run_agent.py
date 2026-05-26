@@ -938,24 +938,28 @@ class AIAgent:
         if is_gpt5_codex and est_tokens > 10_000:
             # ChatGPT's Codex backend can stay completely silent before the
             # first SSE frame, especially once Hermes sends a real agent turn
-            # with tools/skills/history.  The old 600s "legacy grace" still
-            # kills healthy GPT-5.5 runs around ~70k context, before
-            # ``response.created`` ever appears.  For this backend, let the
-            # underlying request timeout be the first-event ceiling; after any
-            # SSE event arrives, ``interruptible_api_call`` switches to the
-            # normal idle-timeout path and still catches genuinely stalled
-            # streams.
-            return max(stale_base, self._resolved_api_call_timeout())
+            # with tools/skills/history.  Give that path more first-event
+            # grace than generic providers, but do NOT fall through to the
+            # SDK's 1800s default — that turns backend stalls into half-hour
+            # "agent is wedged" sessions.  If the user explicitly configured
+            # a shorter request timeout, honor it as the ceiling.
+            if est_tokens > 100_000:
+                bounded_grace = 720.0
+            elif est_tokens > 50_000:
+                bounded_grace = 480.0
+            else:
+                bounded_grace = 240.0
+            return max(stale_base, min(self._resolved_api_call_timeout(), bounded_grace))
         if est_tokens > 100_000:
             # Keep the lower #31967 ceiling for non-ChatGPT providers.
             if is_chatgpt_codex:
-                return max(stale_base, self._resolved_api_call_timeout())
+                return max(stale_base, 720.0)
             return max(stale_base, 240.0)
         if est_tokens > 50_000:
             # Real ChatGPT Codex runs still hit first-event stalls in the
             # 50k-100k band; generic providers keep the shorter ceiling.
             if is_chatgpt_codex:
-                return max(stale_base, self._resolved_api_call_timeout())
+                return max(stale_base, 480.0)
             return max(stale_base, 150.0)
         return stale_base
 
