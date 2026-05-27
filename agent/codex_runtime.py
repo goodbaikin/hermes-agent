@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import traceback
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -348,6 +349,50 @@ def run_codex_stream(
                     on_stream_activity=on_stream_activity,
                 )
             raise
+        except TypeError as exc:
+            # SDK bug: chatgpt.com/backend-api/codex sometimes sends
+            # response.completed with output=null, causing
+            # openai/_parsing/_responses.py:parse_response() to crash on
+            # `for output in response.output:`` (NoneType not iterable).
+            # We've already collected streamed text + output items from the
+            # SSE events; synthesize a response from what we have instead
+            # of throwing everything away.
+            logger.warning(
+                "Codex stream TypeError (SDK parse_response crash on "
+                "response.output=null): %s. Synthesizing response from "
+                "collected stream data (%d text deltas, %d output items).",
+                exc,
+                len(agent._codex_streamed_text_parts),
+                len(collected_output_items),
+            )
+            # Build a synthetic response from accumulated stream data
+            assembled = "".join(agent._codex_streamed_text_parts)
+            if assembled or collected_output_items:
+                _synthetic_output = collected_output_items if collected_output_items else [SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )]
+                return SimpleNamespace(
+                    id="synthetic_from_stream",
+                    object="response",
+                    status="completed",
+                    model=api_kwargs.get("model", "unknown"),
+                    output=_synthetic_output,
+                    output_text=assembled,
+                    usage=SimpleNamespace(input_tokens=0, output_tokens=0, total_tokens=0),
+                )
+            # No data collected — fall through to fallback
+            logger.debug(
+                "Codex stream TypeError with no collected data; "
+                "falling back to create(stream=True).",
+            )
+            return agent._run_codex_create_stream_fallback(
+                api_kwargs,
+                client=active_client,
+                on_stream_activity=on_stream_activity,
+            )
 
 
 
