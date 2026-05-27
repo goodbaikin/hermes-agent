@@ -96,7 +96,11 @@ async def handle_session_chat(
 
     model = _effective_session_model(session, body)
     system_message = body.get("system_message")
-    history = db.get_messages_as_conversation(session_id, include_ancestors=True)
+    # Agent replay must use the live session transcript only.  Lineage is a
+    # display/API concern (`/messages?include_lineage=true`); feeding parent
+    # compression sessions back into the model re-inflates compressed chats and
+    # can trigger preflight compression on every turn.
+    history = db.get_messages_as_conversation(session_id, include_ancestors=False)
     loop = asyncio.get_event_loop()
 
     def _run():
@@ -209,7 +213,11 @@ async def handle_session_chat_stream(
         logger.debug("[chat/stream] Built multimodal content with %d parts", len(user_content))
 
     system_message = body.get("system_message")
-    history = db.get_messages_as_conversation(session_id, include_ancestors=True)
+    # Agent replay must use the live session transcript only.  Lineage is a
+    # display/API concern (`/messages?include_lineage=true`); feeding parent
+    # compression sessions back into the model re-inflates compressed chats and
+    # can trigger preflight compression on every turn.
+    history = db.get_messages_as_conversation(session_id, include_ancestors=False)
     assistant_message_id = f"msg_asst_{uuid.uuid4().hex}"
 
     # Note: user message persistence is handled by AIAgent._flush_messages_to_session_db

@@ -1299,8 +1299,48 @@ class TestSessionChat:
                 assert "usage" in data
                 assert data["usage"]["input_tokens"] == 100
                 adapter._session_db.get_messages_as_conversation.assert_called_with(
-                    "sess_chat", include_ancestors=True
+                    "sess_chat", include_ancestors=False
                 )
+
+    @pytest.mark.asyncio
+    async def test_session_chat_does_not_replay_ancestors_into_agent_history(self, adapter):
+        """Agent input must use only the live session transcript, not UI lineage."""
+        adapter._session_db.get_session.return_value = {
+            "session_id": "child",
+            "title": "Compressed Chat #2",
+            "source": "api_server",
+            "model": "hermes-agent",
+            "parent_session_id": "parent",
+        }
+        child_history = [
+            {"role": "user", "content": "compressed summary only"},
+        ]
+        adapter._session_db.get_messages_as_conversation.return_value = child_history
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+            "partial": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+        mock_agent.session_prompt_tokens = 10
+        mock_agent.session_completion_tokens = 1
+        mock_agent.session_total_tokens = 11
+
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post("/api/sessions/child/chat", json={"message": "続き"})
+                assert resp.status == 200
+
+        adapter._session_db.get_messages_as_conversation.assert_called_with(
+            "child", include_ancestors=False
+        )
+        mock_agent.run_conversation.assert_called_once()
+        assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == child_history
 
     @pytest.mark.asyncio
     async def test_session_chat_returns_rotated_compression_session_id(self, adapter):
@@ -1339,7 +1379,7 @@ class TestSessionChat:
         assert data["session_id"] == "child"
         assert data["continued_from"] == "parent"
         adapter._session_db.get_messages_as_conversation.assert_called_with(
-            "parent", include_ancestors=True
+            "parent", include_ancestors=False
         )
 
     @pytest.mark.asyncio
@@ -1462,8 +1502,53 @@ class TestSessionChatStream:
                 # Verify final response content
                 assert "Streamed response!" in body
                 adapter._session_db.get_messages_as_conversation.assert_called_with(
-                    "sess_stream", include_ancestors=True
+                    "sess_stream", include_ancestors=False
                 )
+
+
+    @pytest.mark.asyncio
+    async def test_stream_does_not_replay_ancestors_into_agent_history(self, adapter):
+        """Streaming agent input must not include parent-chain display lineage."""
+        adapter._session_db.get_session.return_value = {
+            "session_id": "child_stream",
+            "title": "Compressed Chat #2",
+            "source": "api_server",
+            "model": "hermes-agent",
+            "parent_session_id": "parent",
+        }
+        child_history = [
+            {"role": "user", "content": "compressed summary only"},
+        ]
+        adapter._session_db.get_messages_as_conversation.return_value = child_history
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {
+            "final_response": "stream ok",
+            "completed": True,
+            "partial": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+        mock_agent.session_prompt_tokens = 10
+        mock_agent.session_completion_tokens = 1
+        mock_agent.session_total_tokens = 11
+
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post(
+                    "/api/sessions/child_stream/chat/stream",
+                    json={"message": "続き"},
+                )
+                assert resp.status == 200
+                await resp.text()
+
+        adapter._session_db.get_messages_as_conversation.assert_called_with(
+            "child_stream", include_ancestors=False
+        )
+        mock_agent.run_conversation.assert_called_once()
+        assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == child_history
 
 
     @pytest.mark.asyncio
@@ -1558,7 +1643,7 @@ class TestSessionChatStream:
         assert '"parent_session_id": "parent"' in body
         assert '"session_id": "child", "run_id"' in body
         adapter._session_db.get_messages_as_conversation.assert_called_with(
-            "parent", include_ancestors=True
+            "parent", include_ancestors=False
         )
 
     @pytest.mark.asyncio
