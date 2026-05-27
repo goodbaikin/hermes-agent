@@ -5,6 +5,8 @@ import uuid
 from typing import Any, Dict, Optional, Tuple
 from aiohttp import web
 
+from agent.model_metadata import estimate_messages_tokens_rough
+
 logger = logging.getLogger(__name__)
 
 
@@ -220,7 +222,22 @@ async def handle_get_session(request: web.Request, *, check_auth, ensure_session
         item = db.get_session(resolved)
         if not item:
             return web.json_response({"error": "Session not found"}, status=404)
-        return web.json_response({"session": _normalize_session_record(item)})
+        normalized = _normalize_session_record(item)
+        if normalized and not normalized.get("current_prompt_tokens"):
+            try:
+                messages = db.get_messages(resolved, order="asc")
+                conversation = [
+                    {"role": msg.get("role"), "content": msg.get("content") or ""}
+                    for msg in messages
+                    if msg.get("role") in {"system", "user", "assistant", "tool"}
+                ]
+                estimated = estimate_messages_tokens_rough(conversation)
+                if estimated > 0:
+                    normalized["estimated_prompt_tokens"] = estimated
+                    normalized["current_prompt_tokens"] = estimated
+            except Exception:
+                logger.debug("Failed to estimate prompt tokens for %s", resolved, exc_info=True)
+        return web.json_response({"session": normalized})
     except Exception as e:
         logger.exception("Error getting session")
         return web.json_response({"error": str(e)}, status=500)
