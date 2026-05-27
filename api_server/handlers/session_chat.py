@@ -553,16 +553,30 @@ async def handle_session_chat_stream(
                 }
                 logger.info("[session_chat] Agent usage for %s: input=%s output=%s total=%s",
                            actual_session_id, usage["input_tokens"], usage["output_tokens"], usage["total_tokens"])
-                # Save current prompt tokens to session DB for context gauge
+                # Save current prompt tokens to session DB for context gauge.
+                # Also persist cumulative token counters here: the agent loop may
+                # only have canonical input_tokens (excluding cache reads/writes),
+                # while the context gauge needs prompt_tokens as the actual context
+                # size. Keeping both in the session row lets the Web UI recover
+                # from /api/sessions/{id} alone.
                 try:
-                    db._execute_write(lambda conn: conn.execute(
-                        "UPDATE sessions SET current_prompt_tokens = ? WHERE id = ?",
-                        (last_prompt, actual_session_id)
-                    ))
+                    if hasattr(db, "update_token_counts"):
+                        db.update_token_counts(
+                            actual_session_id,
+                            input_tokens=_safe_int(getattr(agent, "session_input_tokens", 0)) or usage["input_tokens"],
+                            output_tokens=_safe_int(getattr(agent, "session_output_tokens", 0)) or usage["output_tokens"],
+                            cache_read_tokens=_safe_int(getattr(agent, "session_cache_read_tokens", 0)),
+                            cache_write_tokens=_safe_int(getattr(agent, "session_cache_write_tokens", 0)),
+                            reasoning_tokens=_safe_int(getattr(agent, "session_reasoning_tokens", 0)),
+                            model=getattr(agent, "model", None),
+                            api_call_count=_safe_int(getattr(agent, "session_api_calls", 0)),
+                            absolute=True,
+                        )
+                    db.update_current_prompt_tokens(actual_session_id, last_prompt)
                     logger.info("[session_chat] Saved current_prompt_tokens=%s for session %s",
                                last_prompt, actual_session_id)
                 except Exception as e:
-                    logger.error("[session_chat] Failed to save current_prompt_tokens: %s", e)
+                    logger.error("[session_chat] Failed to save token usage/current_prompt_tokens: %s", e)
         except Exception as e:
             logger.error("[session_chat] Error building usage: %s", e)
 
