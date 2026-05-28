@@ -414,6 +414,8 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        profile: Optional[str] = None,
+        workspace: Optional[str] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -484,6 +486,8 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            profile=profile,
+            workspace=workspace,
         )
 
     def _get_session_db_for_recall(self):
@@ -518,6 +522,7 @@ class AIAgent:
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
+                profile=getattr(self, "profile", None),
             )
             self._session_db_created = True
         except Exception as e:
@@ -4363,7 +4368,13 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        from agent.workspace_context import reset_workspace, set_workspace
+
+        workspace_token = set_workspace(getattr(self, "_workspace", None))
+        try:
+            return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        finally:
+            reset_workspace(workspace_token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

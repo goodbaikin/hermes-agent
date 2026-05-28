@@ -188,6 +188,15 @@ class SessionConnection:
         session_id = self.session_id
         run_id = self._agent_run_id
         db = get_session_db_fn()
+        session_profile = None
+        try:
+            session = db.get_session(session_id)
+            if isinstance(session, dict):
+                profile = session.get("profile")
+                if isinstance(profile, str) and profile.strip():
+                    session_profile = profile.strip()
+        except Exception:
+            session_profile = None
         history = db.get_messages_as_conversation(session_id)
         user_content, persist_text = build_user_content_fn(message, attachments)
 
@@ -264,6 +273,7 @@ class SessionConnection:
                     tool_progress_callback=_on_tool_progress,
                     tool_start_callback=_on_tool_start,
                     tool_complete_callback=_make_tool_complete_callback(run_id, loop),
+                    profile=session_profile,
                 )
                 agent._session_db = db
                 return agent.run_conversation(

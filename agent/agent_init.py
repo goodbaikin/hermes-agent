@@ -278,8 +278,8 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
-    profile: str = None,
-    workspace: str = None,
+    profile: Optional[str] = None,
+    workspace: Optional[str] = None,
 ):
     """
     Initialize the AI Agent.

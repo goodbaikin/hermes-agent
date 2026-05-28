@@ -215,6 +215,47 @@ class TestSessionConnectionAgentRun:
         assert run_failed["error"] == "provider timed out"
 
     @pytest.mark.asyncio
+    async def test_start_agent_run_passes_session_profile_to_agent_factory(self):
+        conn = SessionConnection("sess_csharp")
+        captured = {}
+
+        class FakeDB:
+            def get_session(self, session_id):
+                return {"id": session_id, "profile": "csharp-eng"}
+
+            def get_messages_as_conversation(self, session_id):
+                return []
+
+        class FakeAgent:
+            def __init__(self):
+                self._session_db = None
+
+            def run_conversation(self, *args, **kwargs):
+                return {
+                    "final_response": "ok",
+                    "completed": True,
+                    "api_calls": 0,
+                    "messages": [],
+                }
+
+        def create_agent_fn(**kwargs):
+            captured.update(kwargs)
+            return FakeAgent()
+
+        def get_session_db_fn():
+            return FakeDB()
+
+        def build_user_content_fn(message, attachments):
+            return message, message
+
+        await conn.start_agent_run(
+            "hello", None, None,
+            create_agent_fn, get_session_db_fn, build_user_content_fn,
+        )
+
+        assert captured["profile"] == "csharp-eng"
+
+    @pytest.mark.asyncio
     async def test_interrupt_run_no_task(self):
         conn = SessionConnection("sess_1")
         result = await conn.interrupt_run()
