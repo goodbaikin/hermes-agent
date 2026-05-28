@@ -1,7 +1,7 @@
 """Tests for the API server bind-address startup guard.
 
 Validates that is_network_accessible() correctly classifies addresses and
-that connect() refuses to start on non-loopback without API_SERVER_KEY.
+that connect() refuses to start without API_SERVER_KEY.
 """
 
 import socket
@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from api_server.server import StandaloneAPIServer
-from api_server.utils import is_network_accessible
+from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.base import is_network_accessible
 
 
 # ---------------------------------------------------------------------------
@@ -62,14 +62,14 @@ class TestIsNetworkAccessible:
         loopback_result = [
             (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0)),
         ]
-        with patch("socket.getaddrinfo", return_value=loopback_result):
+        with patch("gateway.platforms.base._socket.getaddrinfo", return_value=loopback_result):
             assert is_network_accessible("localhost") is False
 
     def test_hostname_resolving_to_non_loopback(self):
         non_loopback_result = [
             (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0)),
         ]
-        with patch("socket.getaddrinfo", return_value=non_loopback_result):
+        with patch("gateway.platforms.base._socket.getaddrinfo", return_value=non_loopback_result):
             assert is_network_accessible("my-server.local") is True
 
     def test_hostname_mixed_resolution(self):
@@ -79,13 +79,13 @@ class TestIsNetworkAccessible:
             (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0)),
             (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0)),
         ]
-        with patch("socket.getaddrinfo", return_value=mixed_result):
+        with patch("gateway.platforms.base._socket.getaddrinfo", return_value=mixed_result):
             assert is_network_accessible("dual-host.local") is True
 
     def test_dns_failure_fails_closed(self):
         """Unresolvable hostnames should require an API key (fail closed)."""
         with patch(
-            "socket.getaddrinfo",
+            "gateway.platforms.base._socket.getaddrinfo",
             side_effect=socket.gaierror("Name resolution failed"),
         ):
             assert is_network_accessible("nonexistent.invalid") is True
@@ -101,29 +101,30 @@ class TestConnectBindGuard:
 
     @pytest.mark.asyncio
     async def test_refuses_ipv4_wildcard_without_key(self):
-        adapter = StandaloneAPIServer(config=PlatformConfig(enabled=True, extra={"host": "0.0.0.0"}))
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"host": "0.0.0.0"}))
         result = await adapter.connect()
         assert result is False
 
     @pytest.mark.asyncio
     async def test_refuses_ipv6_wildcard_without_key(self):
-        adapter = StandaloneAPIServer(config=PlatformConfig(enabled=True, extra={"host": "::"}))
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"host": "::"}))
         result = await adapter.connect()
         assert result is False
 
-    def test_allows_loopback_without_key(self):
-        """Loopback with no key should pass the guard."""
-        adapter = StandaloneAPIServer(config=PlatformConfig(enabled=True, extra={"host": "127.0.0.1"}))
+    @pytest.mark.asyncio
+    async def test_refuses_loopback_without_key(self):
+        """Loopback binds are still an auth boundary and require API_SERVER_KEY."""
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"host": "127.0.0.1"}))
         assert adapter._api_key == ""
-        # The guard condition: is_network_accessible(host) AND NOT api_key
-        # For loopback, is_network_accessible is False so the guard does not block.
         assert is_network_accessible(adapter._host) is False
+        result = await adapter.connect()
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_allows_wildcard_with_key(self):
         """Non-loopback with a key should pass the guard."""
-        adapter = StandaloneAPIServer(
-            config=PlatformConfig(enabled=True, extra={"host": "0.0.0.0", "key": "sk-test"})
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"host": "0.0.0.0", "key": "sk-test"})
         )
         # The guard checks: is_network_accessible(host) AND NOT api_key
         # With a key set, the guard should not block.

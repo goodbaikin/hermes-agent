@@ -5,10 +5,8 @@ Covers:
   bare lists, and mixed-shape dicts.
 - ``AIAgent._compute_non_stream_stale_timeout`` with both legacy ``messages``
   list and full ``api_kwargs`` dicts.
-- The May 2026 default-base change (300s -> 90s), the lowered generic
-  context-tier ceilings, and the openai-codex first-event grace for normal
-  GPT-5.x agent payloads that gives ChatGPT's Codex backend extra first-event
-  grace without falling all the way back to the 1800s SDK default.
+- The May 2026 default-base change (300s -> 90s) and the lowered
+  context-tier ceilings (450/600 -> 150/240).
 """
 
 from __future__ import annotations
@@ -101,39 +99,6 @@ def test_estimator_unknown_dict_fallback():
     assert estimate_request_context_tokens(payload) > 50
 
 
-# ── Codex TTFB cutoff ──────────────────────────────────────────────────────
-
-
-def test_codex_stream_ttfb_default_is_20s(monkeypatch):
-    from types import SimpleNamespace
-
-    from agent.chat_completion_helpers import _codex_stream_ttfb_timeout
-
-    monkeypatch.delenv("HERMES_CODEX_STREAM_TTFB_TIMEOUT", raising=False)
-    agent = SimpleNamespace(api_mode="codex_responses")
-    assert _codex_stream_ttfb_timeout(agent, 90.0) == 20.0
-
-
-def test_codex_stream_ttfb_honors_env_override(monkeypatch):
-    from types import SimpleNamespace
-
-    from agent.chat_completion_helpers import _codex_stream_ttfb_timeout
-
-    monkeypatch.setenv("HERMES_CODEX_STREAM_TTFB_TIMEOUT", "45")
-    agent = SimpleNamespace(api_mode="codex_responses")
-    assert _codex_stream_ttfb_timeout(agent, 90.0) == 45.0
-
-
-def test_codex_stream_ttfb_never_exceeds_stale_timeout(monkeypatch):
-    from types import SimpleNamespace
-
-    from agent.chat_completion_helpers import _codex_stream_ttfb_timeout
-
-    monkeypatch.setenv("HERMES_CODEX_STREAM_TTFB_TIMEOUT", "45")
-    agent = SimpleNamespace(api_mode="codex_responses")
-    assert _codex_stream_ttfb_timeout(agent, 12.0) == 12.0
-
-
 # ── default base + tier scaling ────────────────────────────────────────────
 
 
@@ -145,7 +110,6 @@ def test_default_base_is_90s(monkeypatch, tmp_path):
     _write_config(tmp_path, "")
 
     agent = _make_agent(tmp_path)
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
     base, implicit = agent._resolved_api_call_stale_timeout_base()
     assert base == 90.0
     assert implicit is True
@@ -159,99 +123,34 @@ def test_short_codex_request_uses_base_only(monkeypatch, tmp_path):
     _write_config(tmp_path, "")
 
     agent = _make_agent(tmp_path)
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
     payload = {"model": "gpt-5.5", "input": "hi", "instructions": ""}
     assert agent._compute_non_stream_stale_timeout(payload) == 90.0
 
 
-def test_normal_gpt5_codex_agent_payload_uses_bounded_first_event_grace(monkeypatch, tmp_path):
-    """openai-codex GPT-5.x payload around 20k tokens gets bounded grace."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / ".env").write_text("", encoding="utf-8")
-    # Matches the real API Server deployment's env override from the reported
-    # log: the fix must not let this 120s base kill normal GPT-5.5 turns,
-    # but also must not stretch every stall to the 1800s SDK default.
-    monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "120")
-    _write_config(tmp_path, "")
-
-    agent = _make_agent(tmp_path)
-    payload = {"model": "gpt-5.5", "input": "x" * 76_800, "instructions": ""}
-    assert agent._compute_non_stream_stale_timeout(payload) == 240.0
-
-
-def test_long_codex_request_uses_bounded_first_event_grace(monkeypatch, tmp_path):
-    """openai-codex payload >50k tokens gets bounded first-event grace."""
+def test_long_codex_request_bumps_to_50k_tier(monkeypatch, tmp_path):
+    """Codex payload > 50k tokens -> at least 150s."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
     _write_config(tmp_path, "")
 
     agent = _make_agent(tmp_path)
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
     payload = {"model": "gpt-5.5", "input": "x" * 240_000, "instructions": ""}
-    assert agent._compute_non_stream_stale_timeout(payload) == 480.0
+    timeout = agent._compute_non_stream_stale_timeout(payload)
+    assert timeout >= 150.0
+    assert timeout < 240.0
 
 
-def test_very_long_codex_request_uses_bounded_first_event_grace(monkeypatch, tmp_path):
-    """openai-codex payload >100k tokens gets bounded first-event grace."""
+def test_very_long_codex_request_bumps_to_100k_tier(monkeypatch, tmp_path):
+    """Codex payload > 100k tokens -> at least 240s."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
     _write_config(tmp_path, "")
 
     agent = _make_agent(tmp_path)
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
     payload = {"model": "gpt-5.5", "input": "x" * 500_000, "instructions": ""}
-    assert agent._compute_non_stream_stale_timeout(payload) == 720.0
-
-
-def test_codex_first_event_grace_caps_explicit_request_timeout(monkeypatch, tmp_path):
-    """An explicit long request timeout does not stretch Codex stalls forever."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / ".env").write_text("", encoding="utf-8")
-    monkeypatch.setenv("HERMES_API_TIMEOUT", "900")
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
-    _write_config(tmp_path, "")
-
-    agent = _make_agent(tmp_path)
-    payload = {"model": "gpt-5.5", "input": "x" * 287_368, "instructions": ""}
-    assert agent._compute_non_stream_stale_timeout(payload) == 480.0
-
-
-def test_generic_very_long_request_uses_lowered_100k_tier(monkeypatch, tmp_path):
-    """Non-ChatGPT providers keep the #31967 240s large-context ceiling."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / ".env").write_text("", encoding="utf-8")
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
-    _write_config(tmp_path, "")
-
-    agent = _make_agent(
-        tmp_path,
-        provider="openai",
-        base_url="https://api.openai.com/v1",
-        model="gpt-5.5",
-    )
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
-    payload = {"model": "gpt-5.5", "input": "x" * 500_000, "instructions": ""}
-    assert agent._compute_non_stream_stale_timeout(payload) == 240.0
-
-
-def test_generic_long_request_uses_lowered_50k_tier(monkeypatch, tmp_path):
-    """Non-ChatGPT providers keep the #31967 150s mid-context ceiling."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / ".env").write_text("", encoding="utf-8")
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
-    _write_config(tmp_path, "")
-
-    agent = _make_agent(
-        tmp_path,
-        provider="openai",
-        base_url="https://api.openai.com/v1",
-        model="gpt-5.5",
-    )
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
-    payload = {"model": "gpt-5.5", "input": "x" * 240_000, "instructions": ""}
-    assert agent._compute_non_stream_stale_timeout(payload) == 150.0
+    assert agent._compute_non_stream_stale_timeout(payload) >= 240.0
 
 
 def test_chat_completions_long_messages_bumps_tier(monkeypatch, tmp_path):
@@ -267,7 +166,6 @@ def test_chat_completions_long_messages_bumps_tier(monkeypatch, tmp_path):
         base_url="https://api.openai.com/v1",
         model="gpt-5.4",
     )
-    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
     payload = {
         "model": "gpt-5.4",
         "messages": [{"role": "user", "content": "x" * 240_000}],

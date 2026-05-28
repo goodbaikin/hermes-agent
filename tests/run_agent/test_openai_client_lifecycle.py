@@ -16,23 +16,17 @@ import run_agent
 
 
 class FakeRequestClient:
-    def __init__(self, responder, stream_factory=None):
+    def __init__(self, responder):
         self._responder = responder
-        self._stream_factory = stream_factory
         self._client = SimpleNamespace(is_closed=False)
         self.chat = SimpleNamespace(
             completions=SimpleNamespace(create=self._create)
         )
-        self.responses = SimpleNamespace(stream=self._stream)
+        self.responses = SimpleNamespace()
         self.close_calls = 0
 
     def _create(self, **kwargs):
         return self._responder(**kwargs)
-
-    def _stream(self, **kwargs):
-        if self._stream_factory is None:
-            raise AssertionError("responses.stream not configured")
-        return self._stream_factory(**kwargs)
 
     def close(self):
         self.close_calls += 1
@@ -41,27 +35,6 @@ class FakeRequestClient:
 
 class FakeSharedClient(FakeRequestClient):
     pass
-
-
-class SlowCodexStream:
-    def __init__(self, *, event_count=28, delay=0.1, final_response=None):
-        self.event_count = event_count
-        self.delay = delay
-        self.final_response = final_response or {"ok": "codex-stream"}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def __iter__(self):
-        for _ in range(self.event_count):
-            time.sleep(self.delay)
-            yield SimpleNamespace(type="response.in_progress")
-
-    def get_final_response(self):
-        return self.final_response
 
 
 class OpenAIFactory:
@@ -137,25 +110,6 @@ def test_stale_non_stream_close_is_single_owner(monkeypatch):
     with pytest.raises(APIConnectionError):
         agent._interruptible_api_call({"model": agent.model, "messages": []})
 
-    assert request_client.close_calls == 1
-
-
-def test_codex_stream_activity_prevents_outer_stale_timeout(monkeypatch):
-    final_response = {"ok": "codex-stream-completed"}
-    request_client = FakeRequestClient(
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("chat path used")),
-        stream_factory=lambda **kwargs: SlowCodexStream(final_response=final_response),
-    )
-    factory = OpenAIFactory([request_client])
-    monkeypatch.setattr(run_agent, "OpenAI", factory)
-
-    agent = _build_agent()
-    agent.api_mode = "codex_responses"
-    agent._compute_non_stream_stale_timeout = lambda api_payload: 0.12
-
-    result = agent._interruptible_api_call({"model": agent.model, "input": [], "store": False})
-
-    assert result == final_response
     assert request_client.close_calls == 1
 
 
