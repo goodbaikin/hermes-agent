@@ -745,12 +745,34 @@ class _CodexCompletionsAdapter:
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
+        first_event_seen = threading.Event()
+        ttfb_timed_out = threading.Event()
+        ttfb_timer: Optional[threading.Timer] = None
+
+        def _ttfb_timeout_seconds() -> Optional[float]:
+            if not total_timeout:
+                return None
+            try:
+                configured = float(os.getenv("HERMES_CODEX_STREAM_TTFB_TIMEOUT", "20"))
+            except (TypeError, ValueError):
+                configured = 45.0
+            if configured <= 0:
+                return None
+            return min(float(total_timeout), configured)
 
         def _timeout_message() -> str:
+            if ttfb_timed_out.is_set() and not first_event_seen.is_set():
+                return (
+                    "Codex auxiliary Responses stream produced no stream events "
+                    f"within {_ttfb_timeout_seconds() or 0:.1f}s TTFB timeout"
+                )
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
 
-        def _close_client_on_timeout() -> None:
-            timed_out.set()
+        def _close_client_on_timeout(ttfb: bool = False) -> None:
+            if ttfb:
+                ttfb_timed_out.set()
+            else:
+                timed_out.set()
             close = getattr(self._client, "close", None)
             if callable(close):
                 try:
@@ -768,7 +790,13 @@ class _CodexCompletionsAdapter:
             except Exception:
                 logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
+        def _close_client_on_ttfb_timeout() -> None:
+            if not first_event_seen.is_set():
+                _close_client_on_timeout(ttfb=True)
+
         def _check_cancelled() -> None:
+            if ttfb_timed_out.is_set() and not first_event_seen.is_set():
+                raise TimeoutError(_timeout_message())
             if deadline is not None and time.monotonic() >= deadline:
                 if not timed_out.is_set():
                     _close_client_on_timeout()
@@ -795,12 +823,21 @@ class _CodexCompletionsAdapter:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
+                ttfb_timeout = _ttfb_timeout_seconds()
+                if ttfb_timeout and ttfb_timeout < float(total_timeout):
+                    ttfb_timer = threading.Timer(ttfb_timeout, _close_client_on_ttfb_timeout)
+                    ttfb_timer.daemon = True
+                    ttfb_timer.start()
             _check_cancelled()
             final = None
             try:
                 with self._client.responses.stream(**resp_kwargs) as stream:
                     for _event in stream:
                         _check_cancelled()
+                        if not first_event_seen.is_set():
+                            first_event_seen.set()
+                            if ttfb_timer is not None:
+                                ttfb_timer.cancel()
                         _etype = getattr(_event, "type", "")
                         if _etype == "response.output_item.done":
                             _done = getattr(_event, "item", None)
@@ -890,6 +927,8 @@ class _CodexCompletionsAdapter:
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
         finally:
+            if ttfb_timer is not None:
+                ttfb_timer.cancel()
             if timeout_timer is not None:
                 timeout_timer.cancel()
 

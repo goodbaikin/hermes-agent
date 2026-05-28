@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -2368,6 +2369,49 @@ class TestCodexAuxiliaryAdapterTimeout:
             )
 
         assert time.monotonic() - started < 0.14
+
+    def test_enforces_ttfb_timeout_before_total_timeout(self, monkeypatch):
+        closed_event = threading.Event()
+
+        class NoFirstEventStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                if not closed_event.wait(1.0):
+                    yield SimpleNamespace(type="response.output_text.delta", delta="too late")
+
+            def get_final_response(self):
+                return SimpleNamespace(output=[], usage=None)
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return NoFirstEventStream()
+
+        closed = {"count": 0}
+
+        def close():
+            closed["count"] += 1
+            closed_event.set()
+
+        monkeypatch.setenv("HERMES_CODEX_STREAM_TTFB_TIMEOUT", "0.05")
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=close)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError) as exc_info:
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=5,
+            )
+
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.16
+        assert "no stream events" in str(exc_info.value)
+        assert closed["count"] >= 1
 
 
 # ---------------------------------------------------------------------------
