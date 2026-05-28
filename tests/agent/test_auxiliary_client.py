@@ -2663,7 +2663,7 @@ class TestCodexAuxiliaryAdapterTimeout:
                 return SimpleNamespace(output=[], usage=None)
 
         class FakeResponses:
-            def stream(self, **kwargs):
+            def create(self, **kwargs):
                 return NoFirstEventStream()
 
         closed = {"count": 0}

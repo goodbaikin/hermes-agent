@@ -734,19 +734,43 @@ class _CodexCompletionsAdapter:
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
+        ttfb_timed_out = threading.Event()
+        first_event_seen = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
+        ttfb_timer: Optional[threading.Timer] = None
 
         def _timeout_message() -> str:
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
 
-        def _close_client_on_timeout() -> None:
-            timed_out.set()
+        def _resolve_ttfb_timeout() -> Optional[float]:
+            raw = os.getenv("HERMES_CODEX_STREAM_TTFB_TIMEOUT")
+            if raw is None:
+                raw = os.getenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS")
+            try:
+                value = float(raw) if raw is not None else 20.0
+            except (TypeError, ValueError):
+                value = 45.0
+            if value <= 0:
+                return None
+            if total_timeout:
+                value = min(value, float(total_timeout))
+            return value
+
+        ttfb_timeout = _resolve_ttfb_timeout()
+
+        def _ttfb_timeout_message() -> str:
+            return (
+                "Codex auxiliary Responses stream emitted no stream events "
+                f"within {float(ttfb_timeout or 0.0):.1f}s TTFB timeout"
+            )
+
+        def _close_client_and_evict(reason: str) -> None:
             close = getattr(self._client, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
-                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+                    logger.debug("Codex auxiliary: client close during %s failed", reason, exc_info=True)
             # The cached auxiliary client wraps this same ``self._client``
             # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
             # this instance).  After we close the httpx transport above, the
@@ -756,7 +780,17 @@ class _CodexCompletionsAdapter:
             try:
                 _evict_cached_client_instance(self._client)
             except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
+                logger.debug("Codex auxiliary: cache eviction on %s failed", reason, exc_info=True)
+
+        def _close_client_on_timeout() -> None:
+            timed_out.set()
+            _close_client_and_evict("timeout")
+
+        def _close_client_on_ttfb_timeout() -> None:
+            if first_event_seen.is_set():
+                return
+            ttfb_timed_out.set()
+            _close_client_and_evict("TTFB timeout")
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
@@ -779,6 +813,10 @@ class _CodexCompletionsAdapter:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
+            if ttfb_timeout:
+                ttfb_timer = threading.Timer(float(ttfb_timeout), _close_client_on_ttfb_timeout)
+                ttfb_timer.daemon = True
+                ttfb_timer.start()
             _check_cancelled()
 
             # Event-driven Responses streaming via the low-level
@@ -797,6 +835,12 @@ class _CodexCompletionsAdapter:
             stream_kwargs["stream"] = True
 
             def _on_each_event(_event: Any) -> None:
+                # The first raw SSE event proves the provider is alive. Cancel
+                # the first-byte watchdog but keep the total timeout active.
+                if not first_event_seen.is_set():
+                    first_event_seen.set()
+                    if ttfb_timer is not None:
+                        ttfb_timer.cancel()
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
                 _check_cancelled()
@@ -856,6 +900,8 @@ class _CodexCompletionsAdapter:
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
         except Exception as exc:
+            if ttfb_timed_out.is_set():
+                raise TimeoutError(_ttfb_timeout_message()) from exc
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
@@ -863,6 +909,8 @@ class _CodexCompletionsAdapter:
         finally:
             if timeout_timer is not None:
                 timeout_timer.cancel()
+            if ttfb_timer is not None:
+                ttfb_timer.cancel()
 
         content = "".join(text_parts).strip() or None
 
