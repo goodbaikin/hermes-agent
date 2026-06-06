@@ -35,7 +35,11 @@ async def handle_capabilities(request: web.Request, *, check_auth, api_key: str 
             "session_key_header": "X-Hermes-Session-Key",
         },
         "endpoints": {
-            "run_status": {"path": "/v1/runs/{run_id}"},
+            "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
+            "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
+            "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+            "skills": {"method": "GET", "path": "/v1/skills"},
+            "toolsets": {"method": "GET", "path": "/v1/toolsets"},
         },
         "toolsets": toolsets,
         "reasoning_modes": reasoning_modes,

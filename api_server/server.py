@@ -5,6 +5,7 @@ import logging
 import os
 import socket as _socket
 import sqlite3
+import stat
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -63,17 +64,25 @@ class ResponseStore:
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
+        self._db_path = db_path
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
                 db_path = str(get_hermes_home() / "response_store.db")
             except Exception:
                 db_path = ":memory:"
+        self._db_path = db_path
         try:
+            if db_path != ":memory:" and not os.path.exists(db_path):
+                fd = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._chmod_owner_only()
         except Exception:
+            self._db_path = ":memory:"
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._chmod_owner_only()
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS responses (
                 response_id TEXT PRIMARY KEY,
@@ -88,6 +97,27 @@ class ResponseStore:
             )"""
         )
         self._conn.commit()
+        self._chmod_owner_only()
+
+    def _chmod_owner_only(self) -> None:
+        """Keep response store DB and SQLite sidecars owner-only when file-backed."""
+        db_path = getattr(self, "_db_path", None)
+        if not db_path or db_path == ":memory:":
+            return
+        for path in (db_path, f"{db_path}-wal", f"{db_path}-shm"):
+            try:
+                if os.path.exists(path):
+                    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                logger.debug("Failed to chmod response store path %s", path, exc_info=True)
+
+    def close(self) -> None:
+        """Close the SQLite connection after tightening file permissions."""
+        self._chmod_owner_only()
+        try:
+            self._conn.close()
+        finally:
+            self._chmod_owner_only()
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
@@ -914,6 +944,69 @@ class StandaloneAPIServer:
         """GET /v1/capabilities -- list available toolsets and reasoning modes."""
         from api_server.handlers.capabilities import handle_capabilities
         return await handle_capabilities(request, check_auth=self._check_auth, api_key=self._api_key)
+
+    async def _handle_skills(self, request: "web.Request") -> "web.Response":
+        """GET /v1/skills -- list installed skills visible to the API-server agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from tools.skills_tool import _find_all_skills, _sort_skills
+            skills = _sort_skills(_find_all_skills(skip_disabled=False))
+        except Exception:
+            logger.exception("GET /v1/skills failed")
+            return web.json_response(
+                _openai_error("Failed to enumerate skills", err_type="server_error"),
+                status=500,
+            )
+
+        return web.json_response({"object": "list", "data": skills})
+
+    async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
+        """GET /v1/toolsets -- list toolsets and their resolved tools."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import (
+                _get_effective_configurable_toolsets,
+                _get_platform_tools,
+                _toolset_has_keys,
+            )
+            from toolsets import resolve_toolset
+
+            config = load_config()
+            enabled_toolsets = _get_platform_tools(
+                config,
+                "api_server",
+                include_default_mcp_servers=False,
+            )
+            data: List[Dict[str, Any]] = []
+            for name, label, desc in _get_effective_configurable_toolsets():
+                try:
+                    tools = sorted(set(resolve_toolset(name)))
+                except Exception:
+                    tools = []
+                data.append({
+                    "name": name,
+                    "label": label,
+                    "description": desc,
+                    "enabled": name in enabled_toolsets,
+                    "configured": _toolset_has_keys(name, config),
+                    "tools": tools,
+                })
+        except Exception:
+            logger.exception("GET /v1/toolsets failed")
+            return web.json_response(
+                _openai_error("Failed to enumerate toolsets", err_type="server_error"),
+                status=500,
+            )
+
+        return web.json_response({"object": "list", "platform": "api_server", "data": data})
+
     async def _handle_available_models(self, request: "web.Request") -> "web.Response":
         """GET /api/available-models -- list provider models and available providers."""
         from api_server.handlers.config import handle_available_models
@@ -1366,6 +1459,8 @@ class StandaloneAPIServer:
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/skills", self._handle_skills)
+            self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

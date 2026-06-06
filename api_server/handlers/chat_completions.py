@@ -43,6 +43,9 @@ async def handle_chat_completions(
     auth_err = adapter._check_auth(request)
     if auth_err:
         return auth_err
+    session_key, session_key_err = adapter._parse_session_key_header(request)
+    if session_key_err:
+        return session_key_err
 
     # Parse request body
     try:
@@ -211,6 +214,7 @@ async def handle_chat_completions(
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
+            gateway_session_key=session_key,
             stream_delta_callback=_on_delta,
             tool_progress_callback=_on_tool_progress,
             tool_start_callback=_on_tool_start,
@@ -223,6 +227,7 @@ async def handle_chat_completions(
             request, completion_id, model_name, created, _stream_q,
             agent_task, agent_ref, session_id=session_id,
             adapter=adapter,
+            session_key=session_key,
         )
 
     # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -232,6 +237,7 @@ async def handle_chat_completions(
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
+            gateway_session_key=session_key,
         )
 
     idempotency_key = request.headers.get("Idempotency-Key")
@@ -256,9 +262,36 @@ async def handle_chat_completions(
             )
 
     final_response = result.get("final_response", "")
-    if not final_response:
-        final_response = result.get("error", "(No response generated)")
+    has_text = isinstance(final_response, str) and bool(final_response)
+    completed = result.get("completed", True)
+    partial = bool(result.get("partial", False))
+    failed = bool(result.get("failed", False))
+    error_text = str(result.get("error") or "")
 
+    headers = {"X-Hermes-Session-Id": session_id}
+    if session_key:
+        headers["X-Hermes-Session-Key"] = session_key
+
+    if not has_text and (failed or completed is False or partial):
+        headers["X-Hermes-Completed"] = "false"
+        if partial:
+            headers["X-Hermes-Partial"] = "true"
+        error_payload = _openai_error(
+            error_text or "Agent did not complete and produced no assistant text",
+            err_type="server_error",
+            code="agent_incomplete",
+        )
+        error_payload["error"]["hermes"] = {"partial": partial, "completed": completed, "failed": failed}
+        return web.json_response(
+            error_payload,
+            status=502,
+            headers=headers,
+        )
+
+    if not has_text:
+        final_response = error_text or "(No response generated)"
+
+    finish_reason = "length" if (partial or completed is False) else "stop"
     response_data = {
         "id": completion_id,
         "object": "chat.completion",
@@ -271,7 +304,7 @@ async def handle_chat_completions(
                     "role": "assistant",
                     "content": final_response,
                 },
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -281,7 +314,19 @@ async def handle_chat_completions(
         },
     }
 
-    return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+    if partial or completed is False or failed:
+        response_data["hermes"] = {
+            "partial": partial,
+            "completed": completed,
+            "failed": failed,
+            "error_code": "output_truncated" if (partial or completed is False) else "agent_failed",
+        }
+        if error_text:
+            response_data["hermes"]["error"] = error_text
+        headers["X-Hermes-Completed"] = "true" if completed is True else "false"
+        headers["X-Hermes-Partial"] = "true" if partial else "false"
+
+    return web.json_response(response_data, headers=headers)
 
 
 async def write_sse_chat_completion(
@@ -293,6 +338,7 @@ async def write_sse_chat_completion(
     agent_task,
     agent_ref=None,
     session_id: str = None,
+    session_key: str = None,
     *,
     adapter: Any,
 ) -> web.StreamResponse:
@@ -315,6 +361,8 @@ async def write_sse_chat_completion(
         sse_headers.update(cors)
     if session_id:
         sse_headers["X-Hermes-Session-Id"] = session_id
+    if session_key:
+        sse_headers["X-Hermes-Session-Key"] = session_key
     response = web.StreamResponse(status=200, headers=sse_headers)
     await response.prepare(request)
 
