@@ -316,6 +316,22 @@ async def handle_update_session(request: web.Request, *, check_auth, ensure_sess
             db.update_system_prompt(resolved, str(body.get("system_prompt") or "").strip())
         if "end_reason" in body:
             db.end_session(resolved, str(body.get("end_reason") or "updated"))
+        if "profile" in body:
+            current = db.get_session(resolved)
+            if current is None:
+                return web.json_response({"error": "Session not found"}, status=404)
+            profile = str(body.get("profile") or "").strip() or None
+
+            def _do_profile(conn):
+                cur = conn.execute(
+                    "UPDATE sessions SET profile = ? WHERE id = ?",
+                    (profile, resolved),
+                )
+                return cur.rowcount
+
+            ok = (db._execute_write(_do_profile) or 0) > 0
+            if not ok:
+                return web.json_response({"error": "Session not found"}, status=404)
         if any(key in body for key in ("model", "model_config", "provider", "base_url", "api_mode")):
             current = db.get_session(resolved)
             if current is None:

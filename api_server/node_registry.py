@@ -104,6 +104,12 @@ class NodeRegistry:
         idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Invoke a command on a remote node and wait for the response."""
+        try:
+            timeout_ms = int(float(timeout_ms))
+        except (TypeError, ValueError):
+            timeout_ms = 30000
+        if timeout_ms <= 0:
+            timeout_ms = 30000
         node = self._nodes.get(node_id)
         if not node:
             return {"ok": False, "error": {"code": "NOT_FOUND", "message": f"Node {node_id} not connected"}}

@@ -3,6 +3,26 @@ from types import SimpleNamespace
 import run_agent
 
 
+def test_aiagent_resolves_profile_configured_workspace(monkeypatch, tmp_path):
+    import agent.agent_init as agent_init
+    import hermes_cli.profiles as profiles
+
+    default_dir = tmp_path / "default"
+    profile_dir = tmp_path / "profiles" / "webui-lite-eng"
+    default_dir.mkdir(parents=True)
+    profile_dir.mkdir(parents=True)
+    (default_dir / "config.yaml").write_text("workspace_mode: replace\n", encoding="utf-8")
+    (profile_dir / "config.yaml").write_text(
+        "workspace_mode: replace\nactive_workspace: webui\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(agent_init, "get_hermes_home", lambda: str(default_dir))
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: profile_dir)
+
+    assert agent_init._resolve_active_workspace(None, "webui-lite-eng") == "webui"
+
+
 def test_aiagent_accepts_profile_workspace_and_forwards(monkeypatch):
     captured = {}
 

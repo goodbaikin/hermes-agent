@@ -35,6 +35,7 @@ import logging
 import os
 import platform
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -946,20 +947,34 @@ def _execute_remote(
         )
         rpc_thread.start()
 
-        # Build environment variable prefix for the script
+        # Build environment variable prefix for the script.  Remote/project
+        # mode may run from the user's workspace instead of the staging dir;
+        # keep the generated hermes_tools.py importable by prepending the
+        # staging dir to PYTHONPATH (same contract as the local path).
         env_prefix = (
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
+            f"PYTHONPATH={shlex.quote(sandbox_dir)}${{PYTHONPATH:+:$PYTHONPATH}} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={tz}"
 
-        # Execute the script on the remote backend
+        # Execute the script on the remote backend.  In project mode, run from
+        # the live remote workspace while loading script.py/hermes_tools.py from
+        # the staging dir via absolute path + PYTHONPATH.
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
+        _mode = _get_execution_mode()
+        _remote_cwd = sandbox_dir
+        if _mode == "project":
+            live_cwd = getattr(env, "cwd", None)
+            if isinstance(live_cwd, str) and live_cwd.strip():
+                _remote_cwd = live_cwd.strip()
+
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"{env_prefix} python3 {shlex.quote(f'{sandbox_dir}/script.py')}",
+            cwd=_remote_cwd,
             timeout=timeout,
         )
 
@@ -1499,8 +1514,47 @@ def execute_code(
 
 
 def _kill_process_group(proc, escalate: bool = False):
-    """Kill the child and its entire process tree (cross-platform via psutil)."""
-    import psutil
+    """Kill the child and its process tree.
+
+    Prefer psutil when available because it handles cross-platform child
+    enumeration. Fall back to the process group on POSIX (the child is spawned
+    with os.setsid) or taskkill on Windows so execute_code still works in lean
+    environments where psutil is not installed.
+    """
+    try:
+        import psutil  # type: ignore
+    except ModuleNotFoundError:
+        psutil = None
+
+    def _fallback_kill(sig: int | None = None) -> None:
+        try:
+            if _IS_WINDOWS:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                os.killpg(os.getpgid(proc.pid), sig or signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.debug("Could not kill process group via fallback: %s", exc, exc_info=True)
+            try:
+                proc.kill()
+            except Exception as exc2:
+                logger.debug("Could not kill process: %s", exc2, exc_info=True)
+
+    if psutil is None:
+        _fallback_kill(signal.SIGTERM)
+        if escalate:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _fallback_kill(signal.SIGKILL if not _IS_WINDOWS else None)
+        return
+
     try:
         parent = psutil.Process(proc.pid)
         children = parent.children(recursive=True)
@@ -1517,10 +1571,7 @@ def _kill_process_group(proc, escalate: bool = False):
         pass
     except (PermissionError, OSError) as e:
         logger.debug("Could not terminate process tree: %s", e, exc_info=True)
-        try:
-            proc.kill()
-        except Exception as e2:
-            logger.debug("Could not kill process: %s", e2, exc_info=True)
+        _fallback_kill(signal.SIGTERM)
 
     if escalate:
         # Give the process 5s to exit after SIGTERM, then SIGKILL
@@ -1542,10 +1593,7 @@ def _kill_process_group(proc, escalate: bool = False):
                 pass
             except (PermissionError, OSError) as e:
                 logger.debug("Could not kill process tree: %s", e, exc_info=True)
-                try:
-                    proc.kill()
-                except Exception as e2:
-                    logger.debug("Could not kill process: %s", e2, exc_info=True)
+                _fallback_kill(signal.SIGKILL if not _IS_WINDOWS else None)
 
 
 def _load_config() -> dict:

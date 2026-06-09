@@ -68,13 +68,14 @@ async def handle_get_profile_config(
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
 
-        active_workspace = config.get("active_workspace")
+        active_workspace = config.get("active_workspace") or config.get("workspace")
         workspaces = config.get("workspaces", {})
         ws_config = workspaces.get(active_workspace, {}) if active_workspace else {}
 
         return web.json_response({
             "name": name,
             "active_workspace": active_workspace,
+            "workspace": active_workspace,
             "workspace_mode": config.get("workspace_mode"),
             "node_id": ws_config.get("node_id", "local"),
             "path_prefixes": ws_config.get("path_prefixes", []),

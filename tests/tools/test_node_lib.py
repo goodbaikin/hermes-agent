@@ -28,3 +28,44 @@ def test_node_patch_v4a_includes_base_dir_when_passed():
         "file.patch",
         {"patch": patch_text, "base_dir": "/tmp/workspace"},
     )
+
+
+def test_node_exec_converts_public_seconds_timeout_to_node_milliseconds():
+    response = {
+        "ok": True,
+        "payload": {"stdout": "done", "stderr": "", "exitCode": 0},
+    }
+
+    with patch("tools.node_lib.node_invoke") as mock_invoke:
+        mock_invoke.return_value = json.dumps(response)
+        result = node_lib.node_exec("node-1", "sleep 1", timeout=30)
+
+    mock_invoke.assert_called_once_with(
+        "node-1",
+        "terminal.exec",
+        {"cmd": "sleep 1", "timeoutMs": 30000},
+        timeout_ms=35000,
+    )
+    assert result["payload"]["output"] == "done"
+
+
+def test_node_exec_default_timeout_is_five_minutes():
+    response = {
+        "ok": True,
+        "payload": {"stdout": "done", "stderr": "", "exitCode": 0},
+    }
+
+    with patch("tools.node_lib.node_invoke") as mock_invoke:
+        mock_invoke.return_value = json.dumps(response)
+        result = node_lib.node_exec("node-1", "long-running-command")
+
+    mock_invoke.assert_called_once_with(
+        "node-1",
+        "terminal.exec",
+        {"cmd": "long-running-command", "timeoutMs": 300000},
+        timeout_ms=305000,
+    )
+    assert result["payload"]["output"] == "done"
+
+
+

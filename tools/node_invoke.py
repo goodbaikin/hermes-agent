@@ -54,6 +54,12 @@ def node_describe(node_id: str) -> str:
 
 def node_invoke(node_id: str, command: str, params: Optional[Dict[str, Any]] = None, timeout_ms: int = 30000) -> str:
     """Invoke a command on a remote node."""
+    try:
+        timeout_ms = int(float(timeout_ms))
+    except (TypeError, ValueError):
+        timeout_ms = 30000
+    if timeout_ms <= 0:
+        timeout_ms = 30000
     
     # ローカルノードの場合は直接実行
     if node_id == "local":

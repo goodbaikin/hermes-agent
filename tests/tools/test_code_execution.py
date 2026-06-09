@@ -151,7 +151,7 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
                     return {"output": "OK\n"}
-                if "python3 script.py" in command:
+                if "python3" in command and "script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
                 return {"output": ""}
 
@@ -166,12 +166,50 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         mkdir_cmd = env.commands[1][0]
-        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
+        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3" in cmd and "script.py" in cmd)
         cleanup_cmd = env.commands[-1][0]
         self.assertIn("mkdir -p /data/data/com.termux/files/usr/tmp/hermes_exec_", mkdir_cmd)
         self.assertIn("HERMES_RPC_DIR=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
+        self.assertIn("PYTHONPATH=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
+        self.assertIn("/script.py", run_cmd)
         self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
         self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
+
+    def test_execute_remote_project_mode_runs_from_workspace_with_hermes_tools_on_pythonpath(self):
+        class FakeEnv:
+            def __init__(self):
+                self.cwd = "/workspace/project"
+                self.commands = []
+
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, cwd=None, timeout=None):
+                self.commands.append((command, cwd, timeout))
+                if "command -v python3" in command:
+                    return {"output": "OK\n"}
+                if "python3" in command and "script.py" in command:
+                    return {"output": "ok\n", "returncode": 0}
+                return {"output": ""}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+
+        with patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5, "mode": "project"}), \
+             patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")), \
+             patch("tools.code_execution_tool._ship_file_to_remote"), \
+             patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread):
+            result = json.loads(_execute_remote("from hermes_tools import terminal\nprint('ok')", "task-1", ["terminal"]))
+
+        self.assertEqual(result["status"], "success")
+        run_cmd, run_cwd, _ = next(
+            item for item in env.commands
+            if "python3" in item[0] and "script.py" in item[0]
+        )
+        self.assertEqual(run_cwd, "/workspace/project")
+        self.assertIn("PYTHONPATH=/tmp/hermes_exec_", run_cmd)
+        self.assertIn("${PYTHONPATH:+:$PYTHONPATH}", run_cmd)
+        self.assertIn("/script.py", run_cmd)
 
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")

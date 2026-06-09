@@ -177,16 +177,40 @@ def node_lsp_lint(node_id: str, path: str, content: str, workspace_root: str = N
         return []
 
 
-def node_exec(node_id: str, cmd: str, timeout: int = 30, cwd: str = None) -> Dict[str, Any]:
+def _timeout_seconds_to_ms(timeout: int | float | str | None) -> int:
+    """Return a sane node invocation timeout in milliseconds.
+
+    The public ``node_exec`` tool exposes timeout in seconds, while the node
+    control plane uses timeoutMs. Keeping this conversion in one place avoids
+    the nasty seconds-becomes-milliseconds failure mode.
+    """
+    try:
+        seconds = float(timeout if timeout is not None else 300)
+    except (TypeError, ValueError):
+        seconds = 300.0
+    if seconds <= 0:
+        seconds = 300.0
+    return int(seconds * 1000)
+
+
+def node_exec(node_id: str, cmd: str, timeout: int = 300, cwd: Optional[str] = None) -> Dict[str, Any]:
     """Execute a command on a node."""
+    timeout_ms = _timeout_seconds_to_ms(timeout)
     params = {
         "cmd": cmd,
-        "timeout": timeout,
+        "timeoutMs": timeout_ms,
     }
     if cwd:
         params["cwd"] = cwd
     
-    result_str = node_invoke(node_id, "terminal.exec", params)
+    # Let the node command run for timeoutMs, plus a small transport grace
+    # window for result serialization and WebSocket/API round-trips.
+    result_str = node_invoke(
+        node_id,
+        "terminal.exec",
+        params,
+        timeout_ms=max(timeout_ms + 5000, 30000),
+    )
     result = _parse_result(result_str)
     
     # Normalize payload: terminal.exec returns stdout/stderr/exitCode
@@ -479,7 +503,7 @@ try:
                 "properties": {
                     "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
                     "cmd": {"type": "string", "description": "Command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 300},
                 },
                 "required": ["node_id", "cmd"],
             },
@@ -487,7 +511,7 @@ try:
         handler=lambda args, **kw: node_exec(
             node_id=args.get("node_id", ""),
             cmd=args.get("cmd", ""),
-            timeout=args.get("timeout", 30),
+            timeout=args.get("timeout", 300),
         ),
     )
     registry.register(

@@ -210,7 +210,7 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
             cmd = params.get("command", "")
             # Pass cwd to node client so it runs in the correct directory
             workdir = params.get("workdir") or _get_workspace_workdir()
-            result = node_lib.node_exec(node_id, cmd, timeout=params.get("timeout", 180), cwd=workdir)
+            result = node_lib.node_exec(node_id, cmd, timeout=params.get("timeout", 300), cwd=workdir)
             payload = result.get("payload", {})
             return json.dumps({
                 "output": payload.get("output", ""),
