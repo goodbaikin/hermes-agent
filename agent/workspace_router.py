@@ -10,6 +10,7 @@ Target tools: read_file, write_file, patch, search_files, terminal, execute_code
 
 import json
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from agent.workspace_manager import get_workspace_manager
@@ -208,6 +209,7 @@ def route_tool_call(tool_name: str, params: Dict[str, Any], **_kwargs) -> Option
 
         elif tool_name == "terminal":
             cmd = params.get("command", "")
+            cmd = _with_remote_terminal_env_prelude(node_id, cmd)
             # Pass cwd to node client so it runs in the correct directory
             workdir = params.get("workdir") or _get_workspace_workdir()
             result = node_lib.node_exec(node_id, cmd, timeout=params.get("timeout", 300), cwd=workdir)
@@ -265,9 +267,19 @@ def _route_execute_code(node_id: str, params: Dict[str, Any]) -> str:
 
     try:
         from tools import node_lib
-        node_lib.node_write(node_id, temp_name, code)
+        # Match local execute_code's explicit env-passthrough behavior for
+        # remote workspace execution. Only variables allowlisted by loaded skill
+        # frontmatter or terminal.env_passthrough are injected; the rest of the
+        # host environment remains unavailable to the remote script.
+        remote_code = _remote_execute_code_env_prelude() + code
+        node_lib.node_write(node_id, temp_name, remote_code)
         timeout = params.get("timeout", 300)
-        result = node_lib.node_exec(node_id, py_cmd, timeout=timeout)
+        result = node_lib.node_exec(
+            node_id,
+            py_cmd,
+            timeout=timeout,
+            cwd=_get_workspace_workdir(),
+        )
         try:
             node_lib.node_exec(node_id, rm_cmd, timeout=10)
         except Exception:
@@ -281,6 +293,67 @@ def _route_execute_code(node_id: str, params: Dict[str, Any]) -> str:
 
     except Exception as e:
         return json.dumps({"error": f"Remote execute_code failed on {node_id}: {e}"}, ensure_ascii=False)
+
+
+def _load_parent_dotenv_for_remote_execute_code() -> None:
+    """Best-effort load of the parent Hermes .env before env passthrough."""
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        logger.debug("Could not load Hermes .env for remote execute_code", exc_info=True)
+
+
+def _remote_execute_code_env_prelude() -> str:
+    """Build Python source that injects explicitly allowlisted env vars.
+
+    The allowlist comes from tools.env_passthrough: loaded skill
+    required_environment_variables plus terminal.env_passthrough in config.yaml.
+    Hermes provider credentials remain blocked by that module.
+    """
+    env = _get_remote_passthrough_env()
+    if not env:
+        return ""
+
+    return (
+        "# Hermes remote execute_code env passthrough (explicit allowlist only)\n"
+        "import os as _hermes_remote_os\n"
+        f"_hermes_remote_os.environ.update({env!r})\n"
+        "del _hermes_remote_os\n\n"
+    )
+
+
+def _get_remote_passthrough_env() -> Dict[str, str]:
+    """Return explicitly allowlisted host env vars for remote tool execution."""
+    _load_parent_dotenv_for_remote_execute_code()
+    try:
+        from tools.env_passthrough import get_all_passthrough
+        allowed = sorted(get_all_passthrough())
+    except Exception:
+        logger.debug("Could not resolve env passthrough allowlist", exc_info=True)
+        allowed = []
+    return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
+def _with_remote_terminal_env_prelude(node_id: str, cmd: str) -> str:
+    """Inject explicitly allowlisted env vars into a remote terminal command."""
+    env = _get_remote_passthrough_env()
+    if not env:
+        return cmd
+
+    is_windows = node_id.startswith("dev-win") or node_id.startswith("win-")
+    if is_windows:
+        assignments = []
+        for key, value in env.items():
+            escaped = value.replace("'", "''")
+            assignments.append(f"$env:{key}='{escaped}'")
+        return "; ".join(assignments + [cmd])
+
+    import shlex
+    assignments = [f"export {key}={shlex.quote(value)}" for key, value in env.items()]
+    return "; ".join(assignments + [cmd])
 
 
 def get_routing_info(tool_name: str, _params: Optional[Dict] = None) -> Dict[str, Any]:
