@@ -247,7 +247,7 @@ class TestCodexOAuthContextLength:
 
         expected = {
             "gpt-5.5": 272_000,
-            "gpt-5.4": 272_000,
+            "gpt-5.4": 1_000_000,
             "gpt-5.4-mini": 272_000,
             "gpt-5.3-codex": 272_000,
             "gpt-5.3-codex-spark": 128_000,
@@ -328,7 +328,9 @@ class TestCodexOAuthContextLength:
 
     def test_probe_failure_falls_back_to_hardcoded(self):
         """If the probe fails (non-200 / network error), we still return
-        the hardcoded 272k rather than leaking through to models.dev 1.05M."""
+        the hardcoded provider-aware fallback rather than leaking through to
+        direct-API metadata.
+        """
         from agent.model_metadata import get_model_context_length
 
         fake_response = MagicMock()
@@ -338,13 +340,20 @@ class TestCodexOAuthContextLength:
         with patch("agent.model_metadata.requests.get", return_value=fake_response), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
-            ctx = get_model_context_length(
+            ctx_55 = get_model_context_length(
                 model="gpt-5.5",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="expired-token",
                 provider="openai-codex",
             )
-        assert ctx == 272_000
+            ctx_54 = get_model_context_length(
+                model="gpt-5.4",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="expired-token",
+                provider="openai-codex",
+            )
+        assert ctx_55 == 272_000
+        assert ctx_54 == 1_000_000
 
     def test_non_codex_providers_unaffected(self):
         """Resolving gpt-5.5 on non-Codex providers must NOT use the Codex
@@ -469,16 +478,24 @@ class TestCodexOAuthContextLength:
         import yaml as _yaml
         cache_file.write_text(_yaml.dump({"context_lengths": {
             f"gpt-5.5@{base_url}": 272_000,
+            f"gpt-5.4@{base_url}": 1_000_000,
         }}))
 
         with patch("agent.model_metadata.requests.get") as mock_get:
-            ctx = mm.get_model_context_length(
+            ctx_55 = mm.get_model_context_length(
                 model="gpt-5.5",
                 base_url=base_url,
                 api_key="",
                 provider="openai-codex",
             )
-        assert ctx == 272_000
+            ctx_54 = mm.get_model_context_length(
+                model="gpt-5.4",
+                base_url=base_url,
+                api_key="",
+                provider="openai-codex",
+            )
+        assert ctx_55 == 272_000
+        assert ctx_54 == 1_000_000
         mock_get.assert_not_called()
 
     def test_stale_invalidation_scoped_to_codex_provider(self, tmp_path, monkeypatch):

@@ -1312,7 +1312,10 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.2-codex": 272_000,
     "gpt-5.4-mini": 272_000,
     "gpt-5.5": 272_000,
-    "gpt-5.4": 272_000,
+    # Codex OAuth now advertises gpt-5.4 with max_context_window=1,000,000.
+    # Keep the fallback aligned so display / cache paths do not regress to the
+    # older 272k conservative value when the live /models probe is unavailable.
+    "gpt-5.4": 1_000_000,
     "gpt-5.2": 272_000,
     "gpt-5": 272_000,
 }
@@ -1563,6 +1566,11 @@ def get_model_context_length(
                 )
                 _invalidate_cached_context_length(model, base_url)
             elif provider == "openai-codex" and cached >= 400_000:
+                fallback_codex_ctx = _resolve_codex_oauth_context_length(
+                    model, access_token=""
+                )
+                if fallback_codex_ctx and cached == fallback_codex_ctx:
+                    return cached
                 logger.info(
                     "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
                     "re-resolving via fallback/live probe if possible",
