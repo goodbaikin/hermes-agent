@@ -98,24 +98,29 @@ def _normalize_chat_content(
     if isinstance(content, list):
         parts: List[str] = []
         items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+        total_len = 0
         for item in items:
+            added = ""
             if isinstance(item, str):
                 if item:
-                    parts.append(item[:MAX_NORMALIZED_TEXT_LENGTH])
+                    added = item[:MAX_NORMALIZED_TEXT_LENGTH]
             elif isinstance(item, dict):
                 item_type = str(item.get("type") or "").strip().lower()
                 if item_type in {"text", "input_text", "output_text"}:
                     text = item.get("text", "")
                     if text:
                         try:
-                            parts.append(str(text)[:MAX_NORMALIZED_TEXT_LENGTH])
+                            added = str(text)[:MAX_NORMALIZED_TEXT_LENGTH]
                         except Exception:
                             pass
             elif isinstance(item, list):
                 nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
                 if nested:
-                    parts.append(nested)
-            if sum(len(p) for p in parts) >= MAX_NORMALIZED_TEXT_LENGTH:
+                    added = nested
+            if added:
+                parts.append(added)
+                total_len += len(added)
+            if total_len >= MAX_NORMALIZED_TEXT_LENGTH:
                 break
         result = "\n".join(parts)
         return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result

@@ -31,21 +31,31 @@ from agent.web_search_provider import WebSearchProvider
 logger = logging.getLogger(__name__)
 
 
-def _get_searxng_url() -> str:
-    """Resolve SearXNG URL from env or config.yaml."""
-    env_url = os.getenv("SEARXNG_URL", "").strip()
-    if env_url:
-        return env_url
+def _searxng_url() -> str:
+    """Resolve SearXNG URL from Hermes config-aware env, process env, or config.yaml."""
+    try:
+        from hermes_cli.config import get_env_value
+
+        val = get_env_value("SEARXNG_URL")
+    except Exception:
+        val = None
+    if val is None:
+        val = os.getenv("SEARXNG_URL", "")
+    val = (val or "").strip()
+    if val:
+        return val
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config()
-        url = cfg.get("SEARXNG_URL", "").strip()
-        if url:
-            return url
-        web_cfg = cfg.get("web", {})
-        url = web_cfg.get("searxng_url", "").strip()
-        if url:
-            return url
+        val = str(cfg.get("SEARXNG_URL", "") or "").strip()
+        if val:
+            return val
+        web_cfg = cfg.get("web", {}) if isinstance(cfg, dict) else {}
+        if isinstance(web_cfg, dict):
+            val = str(web_cfg.get("searxng_url", "") or "").strip()
+            if val:
+                return val
     except Exception:
         pass
     return ""
@@ -64,7 +74,7 @@ class SearXNGWebSearchProvider(WebSearchProvider):
 
     def is_available(self) -> bool:
         """Return True when ``SEARXNG_URL`` is set."""
-        return bool(_get_searxng_url())
+        return bool(_searxng_url())
 
     def supports_search(self) -> bool:
         return True
@@ -76,7 +86,7 @@ class SearXNGWebSearchProvider(WebSearchProvider):
         """Execute a search against the configured SearXNG instance."""
         import httpx
 
-        base_url = _get_searxng_url().rstrip("/")
+        base_url = _searxng_url().rstrip("/")
         if not base_url:
             return {"success": False, "error": "SEARXNG_URL is not set"}
 
