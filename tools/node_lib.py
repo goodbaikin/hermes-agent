@@ -409,6 +409,42 @@ def node_get_active_window(node_id: str) -> dict:
     return result.get("payload", {})
 
 
+def node_browser_debug_status(node_id: str, port: int = 9222, public_host: Optional[str] = None) -> Dict[str, Any]:
+    """Inspect a node's Chromium-family remote debugging endpoint."""
+    params: Dict[str, Any] = {"port": port}
+    if public_host:
+        params["public_host"] = public_host
+    result_str = node_invoke(node_id, "browser.debug_status", params)
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+
+def node_browser_debug_launch(
+    node_id: str,
+    browser: str = "auto",
+    port: int = 9222,
+    user_data_dir: Optional[str] = None,
+    profile_directory: Optional[str] = None,
+    public_host: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Launch a Chromium-family browser on a node with CDP enabled."""
+    params: Dict[str, Any] = {
+        "browser": browser,
+        "port": port,
+        "extra_args": extra_args or [],
+    }
+    if user_data_dir:
+        params["user_data_dir"] = user_data_dir
+    if profile_directory:
+        params["profile_directory"] = profile_directory
+    if public_host:
+        params["public_host"] = public_host
+    result_str = node_invoke(node_id, "browser.debug_launch", params, timeout_ms=30000)
+    result = _parse_result(result_str)
+    return result.get("payload", {})
+
+
 # Tool registration
 try:
     from tools.registry import registry
@@ -584,6 +620,62 @@ try:
             pattern=args.get("pattern", ""),
             path=args.get("path", "."),
             limit=args.get("limit", 50),
+        ),
+    )
+    registry.register(
+        name="node_browser_debug_status",
+        toolset="node",
+        schema={
+            "name": "node_browser_debug_status",
+            "description": "Inspect a node's Chromium-family remote debugging endpoint and get the CDP URL to use with /browser connect",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
+                    "port": {"type": "integer", "description": "Remote debugging port", "default": 9222},
+                    "public_host": {"type": "string", "description": "Optional externally reachable host/IP to rewrite the websocket URL"},
+                },
+                "required": ["node_id"],
+            },
+        },
+        handler=lambda args, **kw: node_browser_debug_status(
+            node_id=args.get("node_id", ""),
+            port=args.get("port", 9222),
+            public_host=args.get("public_host"),
+        ),
+    )
+    registry.register(
+        name="node_browser_debug_launch",
+        toolset="node",
+        schema={
+            "name": "node_browser_debug_launch",
+            "description": "Launch a Chromium-family browser on a node with remote debugging enabled for later /browser connect use",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "Node ID ('local' for this machine)"},
+                    "browser": {"type": "string", "description": "Browser to launch: auto, chrome, edge, brave, chromium", "default": "auto"},
+                    "port": {"type": "integer", "description": "Remote debugging port", "default": 9222},
+                    "user_data_dir": {"type": "string", "description": "Optional Chromium user-data-dir. Use this if you need an isolated debug profile."},
+                    "profile_directory": {"type": "string", "description": "Optional profile directory name inside the user data dir, e.g. Default or Profile 1"},
+                    "public_host": {"type": "string", "description": "Optional externally reachable host/IP to rewrite the websocket URL"},
+                    "extra_args": {
+                        "type": "array",
+                        "description": "Extra Chromium command-line arguments",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["node_id"],
+            },
+        },
+        handler=lambda args, **kw: node_browser_debug_launch(
+            node_id=args.get("node_id", ""),
+            browser=args.get("browser", "auto"),
+            port=args.get("port", 9222),
+            user_data_dir=args.get("user_data_dir"),
+            profile_directory=args.get("profile_directory"),
+            public_host=args.get("public_host"),
+            extra_args=args.get("extra_args"),
         ),
     )
 except ImportError:

