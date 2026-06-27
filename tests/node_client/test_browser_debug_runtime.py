@@ -72,6 +72,49 @@ def test_browser_debug_status_payload_rewrites_websocket_host(monkeypatch):
     assert payload["suggested_connect_url"] == "ws://192.168.1.50:9222/devtools/browser/abc123"
 
 
+def test_browser_debug_status_payload_prefers_relay_when_configured(monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "_read_browser_debug_payload",
+        lambda host, port: {
+            "Browser": "Chrome/137.0",
+            "Protocol-Version": "1.3",
+            "User-Agent": "Chrome",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/abc123",
+            "_target_count": 4,
+        },
+    )
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        mod,
+        "_ensure_windows_browser_relay",
+        lambda discovery_port, exposed_port, public_host, ensure_firewall=True: {
+            "supported": True,
+            "configured": True,
+            "reachable": True,
+            "listen_port": exposed_port,
+            "connect_port": discovery_port,
+            "listen_address": "0.0.0.0",
+            "connect_address": "127.0.0.1",
+            "rule_name": f"Hermes CDP Relay {exposed_port}",
+            "public_host": public_host,
+            "errors": [],
+        },
+    )
+
+    payload = mod._browser_debug_status_payload(
+        port=9222,
+        discovery_host="127.0.0.1",
+        public_host="192.168.1.50",
+        exposed_port=9224,
+        ensure_exposed=True,
+    )
+
+    assert payload["suggested_connect_url"] == "ws://192.168.1.50:9224/devtools/browser/abc123"
+    assert payload["relay"]["configured"] is True
+    assert payload["relay"]["reachable"] is True
+
+
 def test_build_arg_parser_registers_allow_computer_use_flag():
     parser = mod.build_arg_parser()
     args = parser.parse_args(["--allow-computer-use"])
